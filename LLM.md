@@ -275,20 +275,24 @@ container; the gVisor target can).
    so the proxy's `X-API-Key` and the daemon's key are one value, not a pair.
    Devs do not `kubectl apply` it — cd.hanzo.ai syncs that file.
 
-   THREE THINGS GATE IT RUNNING, and none is code here:
+   TWO THINGS GATE IT RUNNING, and neither is code here:
 
-   * **gVisor is installed on no node.** `gvisor-installer` has been 0/0/0 for
-     over a month — its nodeSelector named a pool that does not exist. The fix
-     is committed (`infra/k8s/gvisor`, re-pointed at `worker-pool`) but the
-     `universe` Application that owns `infra/k8s` is manual-sync, so nothing has
-     applied it. Until it does, `runtimeClassName: gvisor` is a promise the
-     cluster cannot keep.
-   * **The pool cannot hold this pod.** worker-pool is s-4vcpu-8gb — ~6.2Gi
-     allocatable against the 8Gi this daemon asks for. runsc has to be installed
-     somewhere larger, or lsp gets its own pool.
+   * **The pool is too small.** `runtimeClassName: gvisor` resolves now —
+     `code-exec-pool` is two s-4vcpu-8gb nodes labelled `workload=code-exec`,
+     tainted `dedicated=code-exec`, with runsc installed and the RuntimeClass
+     merging both into this pod at admission. But ~6.2Gi allocatable against the
+     8Gi this daemon asks for means Pending on `Insufficient memory` until the
+     pool is resized. One `doctl` resize, no code.
    * **The image.** CI is `.hanzo/workflows/cicd.yml` → `hanzoai/ci` on the
      git.hanzo.ai runners, publishing `ghcr.io/hanzoai/lsp`. The values file
      carries tag AND digest, bumped in a reviewed commit.
+
+   Note what the values file does NOT say: which nodes. The pool went from not
+   existing to two tainted nodes while that file was being written, and it did
+   not have to change, because naming the RuntimeClass names the node set by
+   reference. A file that had copied the selector would now be wrong — and a
+   nodeSelector that conflicts with the RuntimeClass's does not misplace a pod,
+   it rejects it.
 
    Note what does NOT gate it: a wrong node, a missing RuntimeClass or a kernel
    that will not make a user namespace are all survivable, because the boot-time
