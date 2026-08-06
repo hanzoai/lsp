@@ -127,6 +127,19 @@ var table = map[string]Lang{
 			"GOPATH=/tmp/gopath",
 			"GOCACHE=/tmp/gocache",
 			"GOENV=off",
+			// GOROOT is set explicitly because the shipped `go` is built -trimpath,
+			// so it carries no compiled-in root, and the jail gives it no way to
+			// find one: os.Executable reads /proc/self/exe, and /proc is not bound
+			// in (toolchainRead is a host allow-list, not a full filesystem). Without
+			// this, `go` and every gopls subprocess die with "cannot find GOROOT
+			// directory". /usr/local is bound (toolchainRead), so /usr/local/go — the
+			// image's Go — is present at this path inside the jail.
+			"GOROOT=/usr/local/go",
+			// GOTELEMETRY=off stops the toolchain from spawning its counter child,
+			// which also calls os.Executable and logs a failure against the absent
+			// /proc. Telemetry is best-effort and never blocks a command, but the
+			// jail has nothing to send and no reason to try.
+			"GOTELEMETRY=off",
 		},
 		FetchEnv: []string{"GOPROXY=${proxy}", "GOSUMDB=${sumdb}", "GOFLAGS=-mod=mod"},
 		// GOPROXY=off and -mod=readonly are belt to the seccomp braces: the serve
