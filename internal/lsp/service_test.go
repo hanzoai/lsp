@@ -17,7 +17,18 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/hanzoai/lsp/internal/jail"
 )
+
+// TestMain gives this test binary the daemon's own first line, for the same
+// reason main() has it: the acceptance test runs REAL jails, a jail re-execs
+// `self`, and under `go test` self is this binary. Without it the fetch phase
+// would re-run this suite inside the jail instead of downloading a module.
+func TestMain(m *testing.M) {
+	jail.Child()
+	os.Exit(m.Run())
+}
 
 const testKey = "test-service-key"
 

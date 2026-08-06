@@ -85,7 +85,14 @@ func (s *Service) Prove(ctx context.Context) {
 		s.ready.Store(true)
 		return
 	}
-	if err := jail.Probe(ctx, s.cfg.Stage+"/probe", s.cfg.Stage); err != nil {
+	// THE STAGE IS THE ONLY THING THE PROBE NEEDS, and it is the same directory
+	// the serving path stages every jail in. This once passed a second, scratch
+	// working directory as well — `Probe(Stage+"/probe", Stage)` — and the two
+	// were in a relationship that could not work on any host: the jail mounts a
+	// fresh tmpfs over the root, so a working directory the root sits inside is
+	// masked before the bind can put it back, and the child dies on chdir. There
+	// is no second argument now, so there is nothing left to get wrong.
+	if err := jail.Probe(ctx, s.cfg.Stage); err != nil {
 		s.log.Error("JAIL SELF-TEST FAILED — refusing every request", "err", err)
 		s.note("jail did not initialize: " + err.Error())
 		s.ready.Store(false)
