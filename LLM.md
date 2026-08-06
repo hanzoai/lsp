@@ -71,9 +71,14 @@ order that hid part of it.
 Sorting by depth makes an ancestor-after-descendant order unrepresentable, and
 `TestThePlanHidesNothing` asserts it with no kernel and no privileges.
 
-**Any fork of this jailer has the same bug** — it was copied from
-hanzoai/code-exec's `internal/codeexec/jail_linux.go`, which orders its mounts
-the same way. See the CTO call below: this belongs in one module, not two files.
+**hanzoai/code-exec carries the same ordering, and it is one change away from
+the same bug.** This jailer was copied from its `internal/codeexec/jail_linux.go`,
+which also binds first and mounts `/tmp` after. It is not hit TODAY only because
+it binds the session tree at a fixed `/work` rather than at the tree's own
+absolute path, and its toolchain binds are outside `/tmp`; the day any bind path
+falls under `/tmp`, it fails exactly the way this did. That is a property of a
+call site, not of the jailer — which is the argument for the CTO call below: a
+boundary that exists in two files drifts, and this is what the drift looks like.
 
 Off Linux there is no jail to require, and the daemon says so loudly in the log
 and on `/readyz`. The image is linux/amd64, so that case is a developer's
