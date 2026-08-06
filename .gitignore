@@ -1,0 +1,14 @@
+# build output
+/lsp
+/dist/
+*.test
+*.out
+
+# local root / dependency storage
+/var/
+/tmp/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

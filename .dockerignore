@@ -1,0 +1,9 @@
+.git
+.github
+*.md
+Dockerfile
+.dockerignore
+.gitignore
+/dist
+/lsp
+*.test
