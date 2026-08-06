@@ -71,6 +71,27 @@ order that hid part of it.
 Sorting by depth makes an ancestor-after-descendant order unrepresentable, and
 `TestThePlanHidesNothing` asserts it with no kernel and no privileges.
 
+### What the jail brings with it
+
+Three things are the jail's own, present in BOTH phases, and no argument can
+replace them (the first claim on a path wins):
+
+| | what | why |
+|---|---|---|
+| `/tmp` | fresh tmpfs, writable, nosuid+nodev | the only thing a served process can write; dies with the process |
+| `/proc` | fresh procfs **in the jail's own PID namespace**, read-only, nosuid+nodev+noexec | shows the jailed process and its children, nothing of the host |
+| `/dev/{null,zero,full,random,urandom}` | bound from the host, writable | a user namespace cannot `mknod`; none of them holds state |
+
+`/proc` is not a hole — it is a private one, and without it no Go program starts.
+`os.Executable` reads `/proc/self/exe`, `x/telemetry` calls it on init, and gopls
+died at startup with `readlink /proc/self/exe: no such file or directory` while
+the daemon reported only `server stopped`. `GOTELEMETRY=off` does not prevent it:
+x/telemetry reads its mode file, not the environment.
+
+`/dev/null` is required for the same class of reason — Go's `os/exec` opens it
+for every subprocess with no stdin, so without it `go list` cannot run. It is
+bound writable because a read-only mount makes `open(O_WRONLY)` return EROFS.
+
 **hanzoai/code-exec carries the same ordering, and it is one change away from
 the same bug.** This jailer was copied from its `internal/codeexec/jail_linux.go`,
 which also binds first and mounts `/tmp` after. It is not hit TODAY only because
@@ -280,6 +301,15 @@ phase at it with `GOPROXY=file://`, so the REAL `go mod download` runs with no
 network, and then requires `locate definition` on `dep.Greet` to come back
 `external: true` at the module coordinate. It skips where `gopls` is not
 installed.
+
+It could not run JAILED until a `file://` GOPROXY was bound into the fetch jail
+(`proxyDirs` in `internal/lsp/root.go`). The jail binds an allow-list of host
+paths, the proxy was not on it, and `go mod download` reported a module that does
+not exist — so on Linux the test skipped via `needJail` and on a Mac it passed
+unjailed. That is a real deployment shape too, not only a test's: an air-gapped
+mirror on a PVC was a configuration the daemon accepted and could never read.
+Verified end to end on the gVisor node: fetch, gopls start, `locate definition`
+and `hover` all pass inside the jail.
 
 The jail tests interpret the cBPF program the way the kernel would, so the jump
 arithmetic — where an off-by-one silently ALLOWS a denied syscall — is checked

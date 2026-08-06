@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -139,10 +140,17 @@ func TestThePlanIsThePhase(t *testing.T) {
 	}{{serve, false}, {fetch, true}} {
 		var sawWork, sawTmp bool
 		for _, m := range plan(c.p, work, []string{tool}, []string{cache}, 16) {
+			// The jail's OWN entries — its filesystems and its device nodes — are
+			// the same in both phases and are pinned by
+			// TestTheJailBringsItsOwnFilesystems. This test is about the paths a
+			// CALLER supplied.
+			if m.fs != "" && m.path != "/tmp" || strings.HasPrefix(m.path, "/dev/") {
+				continue
+			}
 			switch m.path {
 			case "/tmp":
 				// The jail's own scratch: writable in BOTH phases, and it is the
-				// only thing a served process may write.
+				// only thing a served process may write to that survives a syscall.
 				sawTmp = true
 				if !m.write || m.src != "" {
 					t.Fatalf("%s: /tmp must be a writable tmpfs, got %+v", c.p, m)
@@ -170,14 +178,69 @@ func TestThePlanIsThePhase(t *testing.T) {
 	}
 }
 
-// TestTheJailKeepsItsOwnTmp pins a boundary that must not be reachable from an
-// argument. The jail's /tmp is a private tmpfs that dies with the process and is
-// the only thing a served program may write; a caller naming /tmp as a tree or a
-// cache must not be able to swap the host's directory in for it.
-func TestTheJailKeepsItsOwnTmp(t *testing.T) {
-	for _, m := range plan(fetch, "/tmp", []string{"/tmp"}, []string{"/tmp"}, 16) {
-		if m.path == "/tmp" && m.src != "" {
-			t.Fatalf("a caller replaced the jail's private /tmp with a bind of %s", m.src)
+// TestTheJailBringsItsOwnFilesystems pins the two filesystems the jail creates
+// rather than borrows, and the fact that no argument can reach them.
+//
+// /tmp is a private tmpfs that dies with the process and is the only thing a
+// served program may write. /proc is a private procfs mounted inside the jail's
+// own PID namespace — it shows the jailed process and its children and nothing
+// of the host, and it is read-only. A caller naming either as a tree or a cache
+// must not be able to swap a host directory in for it: a boundary that an
+// argument can replace is not a boundary.
+func TestTheJailBringsItsOwnFilesystems(t *testing.T) {
+	for _, p := range []phase{serve, fetch} {
+		var tmp, proc bool
+		for _, m := range plan(p, "/tmp", []string{"/proc", "/tmp"}, []string{"/proc"}, 16) {
+			switch m.path {
+			case "/tmp":
+				tmp = true
+				if m.fs != "tmpfs" || m.src != "" {
+					t.Fatalf("%s: a caller replaced the jail's /tmp with %+v", p, m)
+				}
+				if !m.write {
+					t.Fatalf("%s: the jail's /tmp must be writable", p)
+				}
+			case "/proc":
+				proc = true
+				if m.fs != "proc" || m.src != "" {
+					t.Fatalf("%s: a caller replaced the jail's /proc with %+v", p, m)
+				}
+				// Read-only, and never a place to execute from. os.Executable
+				// needs to READ /proc/self/exe; nothing needs to write /proc.
+				if m.write {
+					t.Fatalf("%s: /proc must be read-only", p)
+				}
+				if m.flag&syscall.MS_NOEXEC == 0 || m.flag&syscall.MS_NOSUID == 0 ||
+					m.flag&syscall.MS_NODEV == 0 {
+					t.Fatalf("%s: /proc must be nosuid+nodev+noexec, flags=%#x", p, m.flag)
+				}
+			}
+		}
+		if !tmp || !proc {
+			t.Fatalf("%s: the jail must bring its own /tmp and /proc", p)
+		}
+
+		// The device nodes, in BOTH phases. Bound (a userns cannot mknod) and
+		// writable, because Go's os/exec opens /dev/null for every subprocess
+		// with no stdin and a read-only mount makes that EROFS. Required, so a
+		// host without them fails at the cause rather than inside a toolchain.
+		want := map[string]bool{
+			"/dev/null": false, "/dev/zero": false, "/dev/full": false,
+			"/dev/random": false, "/dev/urandom": false,
+		}
+		for _, m := range plan(p, "/roots/x", nil, nil, 16) {
+			if _, ok := want[m.path]; !ok {
+				continue
+			}
+			want[m.path] = true
+			if m.src != m.path || !m.write || !m.must {
+				t.Fatalf("%s: %s must be a required writable bind of itself, got %+v", p, m.path, m)
+			}
+		}
+		for dev, saw := range want {
+			if !saw {
+				t.Fatalf("%s: the jail must bring %s — Go opens it for every subprocess", p, dev)
+			}
 		}
 	}
 }
