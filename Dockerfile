@@ -71,9 +71,26 @@ COPY --from=build /out/lsp /usr/local/bin/lsp
 # Roots and dependency caches live on a PVC mounted at /var/lib/lsp. The staging
 # directory each jail chroots into is /tmp, an emptyDir — it holds nothing but
 # mountpoints and must be writable by the non-root uid.
-RUN groupadd -r lsp && useradd -r -g lsp -d /home/lsp -m lsp \
+#
+# THE UID IS FIXED, NOT ALLOCATED. `useradd -r` takes whatever system id happens
+# to be free in the base image, so the number changes when the base image changes
+# and nothing in this file says so. Two things downstream need it to be a
+# constant and a NUMBER:
+#
+#   * `runAsNonRoot: true` is refused against a USER given as a name — the
+#     kubelet cannot prove `lsp` is not root without resolving /etc/passwd inside
+#     the image, so it does not try:
+#       container has runAsNonRoot and image has non-numeric user (lsp),
+#       cannot verify user is non-root
+#     That is a CreateContainerConfigError at every start, not a warning.
+#   * `fsGroup` on the PVC must name the same group, or the volume mounts
+#     root-owned and the first `go mod download` into it fails on EACCES.
+#
+# 65532 is the conventional distroless non-root id, so this agrees with every
+# other hardened image in the fleet rather than inventing a number.
+RUN groupadd -g 65532 lsp && useradd -u 65532 -g 65532 -d /home/lsp -m lsp \
     && mkdir -p /var/lib/lsp/roots /var/lib/lsp/deps \
-    && chown -R lsp:lsp /var/lib/lsp
+    && chown -R 65532:65532 /var/lib/lsp
 
 ENV LSP_LISTEN=":8000" \
     LSP_ROOTS="/var/lib/lsp/roots" \
@@ -84,7 +101,9 @@ ENV LSP_LISTEN=":8000" \
 # LSP_KEY is NOT set here. It comes from KMS through a KMSSecret; an unset key
 # makes the daemon refuse every request rather than serve whoever asks.
 
-USER lsp
+# The NUMBER, not the name — see the useradd above. `USER lsp` reads better and
+# is the one spelling the kubelet cannot check.
+USER 65532
 EXPOSE 8000
 
 # tini as PID 1 so orphaned language-server processes are reaped.
