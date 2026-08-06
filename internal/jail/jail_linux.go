@@ -173,20 +173,26 @@ func run(p phase) error {
 // ── what the jail's filesystem is ────────────────────────────────────────────
 
 // mount is one line of that filesystem, as a value: what appears at path inside
-// the jail, and whether the program may write it. An empty src means a fresh
-// tmpfs of size MiB rather than a bind of a host path.
+// the jail, and whether the program may write it. fs names a filesystem to
+// create fresh; empty fs means a bind of src.
 //
 // path is ALWAYS the source's own absolute path. Same-path is not a convenience:
 // a language server reports every answer as a file: URI of a path it was given,
 // so a jail that renamed /roots/x to /work would hand the caller paths that name
 // nothing — or would need a translation table, which is a second place for the
 // two sides to disagree. There is nothing to translate here.
+//
+// write is the ONE truth about read-only-ness, for a bind and a fresh filesystem
+// alike: MS_RDONLY is derived from it rather than carried beside it, so the two
+// cannot disagree.
 type mount struct {
-	src   string // the host path to bind; empty ⇒ a fresh tmpfs
-	path  string // absolute, and the same inside the jail as outside
-	size  uint64 // MiB, for a tmpfs
-	write bool   // may the jailed program write it
-	must  bool   // a missing source is an error rather than a skip
+	src   string  // the host path to bind; empty when fs is set
+	fs    string  // "tmpfs" | "proc": a fresh filesystem; empty ⇒ a bind of src
+	opt   string  // mount options for fs
+	flag  uintptr // mount flags for fs, minus MS_RDONLY — see write
+	path  string  // absolute, and the same inside the jail as outside
+	write bool    // may the jailed program write it
+	must  bool    // a missing source is an error rather than a skip
 }
 
 // plan is the whole filesystem the jail will have, ORDERED SHALLOWEST PATH
@@ -205,10 +211,59 @@ type mount struct {
 // the rule is enforced rather than remembered. TestThePlanHidesNothing asserts
 // it directly, needs no privileges, and would have caught this before it shipped.
 func plan(p phase, work string, read, write []string, tmp uint64) []mount {
-	// The jail's own writable /tmp: the ONLY thing a served process can write,
-	// and it dies with the process. Build caches live here for exactly that
-	// reason. Shallowest of all, so everything binds ON it.
-	ms := []mount{{path: "/tmp", size: tmp, write: true}}
+	// The two filesystems the jail brings with it, shallowest of all so
+	// everything binds ON them.
+	ms := []mount{
+		// The jail's own writable /tmp: the ONLY thing a served process can
+		// write, and it dies with the process. Build caches live here for
+		// exactly that reason. nosuid/nodev because a scratch directory has no
+		// business holding a setuid binary or a device node; NOT noexec, since
+		// the go command compiles and runs out of $TMPDIR.
+		{fs: "tmpfs", path: "/tmp", write: true,
+			opt:  fmt.Sprintf("mode=1777,size=%dm", tmp),
+			flag: syscall.MS_NOSUID | syscall.MS_NODEV},
+
+		// A PRIVATE procfs, and it is not a hole in the jail — it is this jail's
+		// own, mounted inside this jail's PID namespace, so it shows the jailed
+		// process and its children and NOTHING of the host. Read-only, nosuid,
+		// nodev, noexec.
+		//
+		// It is here because a Go program cannot start without it. os.Executable
+		// reads /proc/self/exe, and x/telemetry calls it on init, so gopls died
+		// at startup with
+		//
+		//   failed to start telemetry sidecar: os.Executable: readlink
+		//   /proc/self/exe: no such file or directory
+		//   gopls cannot access its persistent index: can't hash gopls executable
+		//
+		// and the daemon reported only "server stopped". GOTELEMETRY=off does not
+		// prevent it: x/telemetry reads its mode file, not the environment. Every
+		// language server this daemon runs is a Go, Node or Python binary that
+		// expects a /proc, so giving the jail its own is the general answer and
+		// removes the reason GOROOT had to be pinned by hand.
+		{fs: "proc", path: "/proc",
+			flag: syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC},
+	}
+
+	// The device nodes every toolchain assumes exist. They are BOUND from the
+	// host rather than created, because a user namespace cannot mknod a device —
+	// that is the one thing CAP_MKNOD inside a userns does not buy.
+	//
+	// They are writable in BOTH phases, and that is not a hole in the serve
+	// phase: none of them holds state. Writes to null and zero are discarded,
+	// full returns ENOSPC, and a write to random or urandom cannot credit
+	// entropy without CAP_SYS_ADMIN in the initial namespace. Read-only would
+	// break them for their actual purpose — `open("/dev/null", O_WRONLY)` on a
+	// read-only mount is EROFS, and Go's os/exec opens exactly that for every
+	// subprocess with no stdin, so `go list` could not run at all.
+	//
+	// REQUIRED, not skipped when absent: a jail without /dev/null fails later and
+	// obscurely, which is the same shape of bug as a mount that hides another.
+	for _, dev := range []string{
+		"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+	} {
+		ms = append(ms, mount{src: dev, path: dev, write: true, must: true})
+	}
 
 	// Serve binds EVERYTHING read-only, including the working tree: a root is
 	// immutable and a language server has no business writing to one. Fetch binds
@@ -256,13 +311,16 @@ func depth(p string) int { return strings.Count(p, string(filepath.Separator)) }
 // make performs one line of the plan, inside the staging root.
 func (m mount) make(root string) error {
 	dst := filepath.Join(root, m.path)
-	if m.src == "" {
-		if err := os.MkdirAll(dst, 0o1777); err != nil {
+	if m.fs != "" {
+		if err := os.MkdirAll(dst, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", m.path, err)
 		}
-		if err := syscall.Mount("tmpfs", dst, "tmpfs", 0,
-			fmt.Sprintf("mode=1777,size=%dm", m.size)); err != nil {
-			return fmt.Errorf("mount %s: %w", m.path, err)
+		flag := m.flag
+		if !m.write {
+			flag |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount(m.fs, dst, m.fs, flag, m.opt); err != nil {
+			return fmt.Errorf("mount %s %s: %w", m.fs, m.path, err)
 		}
 		return nil
 	}

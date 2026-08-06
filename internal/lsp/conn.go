@@ -100,8 +100,16 @@ func (e *rpcError) Error() string { return fmt.Sprintf("lsp: rpc %d: %s", e.Code
 // is what ends it.
 func attach(ctx context.Context, cmd *exec.Cmd, l Lang, root string) (*Conn, error) {
 	// The server's stderr is its own log, not ours to relay: it is chatty and it
-	// echoes tenant source. Dropping it keeps both out of our logs.
-	cmd.Stderr = io.Discard
+	// can echo tenant source, so it is never streamed anywhere. But a server that
+	// DIES writes its reason there and nowhere else, and discarding it outright
+	// left "lsp: server stopped" as the entire account of a startup crash —
+	// exactly the blindness Probe had with `exit status 126`.
+	//
+	// So: keep the LAST 4 KiB and surface it on ONE path, the error below. That
+	// error is built after Close, which kills the process and waits, so what the
+	// server managed to say is all there. Nothing is logged while it is healthy.
+	last := &tail{n: 4 << 10}
+	cmd.Stderr = last
 
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -124,10 +132,46 @@ func attach(ctx context.Context, cmd *exec.Cmd, l Lang, root string) (*Conn, err
 		_ = cmd.Wait()
 	})
 	if err := c.handshake(ctx, l, root); err != nil {
+		// Close first: it kills the process AND waits for it, which drains the
+		// stderr copy. Reading the tail before that races the last words away.
 		c.Close()
-		return nil, err
+		return nil, fmt.Errorf("%w%s", err, last.why())
 	}
 	return c, nil
+}
+
+// tail is a writer that remembers only the last n bytes given to it. A language
+// server is a subprocess parsing a hostile tree and its log is unbounded; this
+// is the bound, so a server that fails while printing forever cannot become the
+// pod's memory problem.
+type tail struct {
+	mu  sync.Mutex
+	buf []byte
+	n   int
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.n {
+		t.buf = t.buf[len(t.buf)-t.n:]
+	}
+	return len(p), nil
+}
+
+// why renders the tail for an error message, and empty when there is nothing to
+// say — so a failure with a silent server does not grow a dangling separator.
+func (t *tail) why() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s := strings.TrimSpace(string(t.buf)); s != "" {
+		return ": " + s
+	}
+	return ""
 }
 
 // newConn puts a Conn on an already-open transport and starts its reader. attach

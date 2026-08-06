@@ -233,7 +233,7 @@ func (s *Service) fetch(ctx context.Context, l Lang, dir, mod string) error {
 		Root:  s.cfg.Stage,
 		Work:  dir,
 		Dir:   filepath.Join(dir, filepath.FromSlash(mod)),
-		Read:  toolchainRead,
+		Read:  append(append([]string{}, toolchainRead...), proxyDirs(s.cfg.Proxy)...),
 		Write: []string{cache},
 		Argv:  argv,
 		Env:   s.env(l, l.FetchEnv),
@@ -308,6 +308,26 @@ func (s *Service) env(l Lang, phase []string) []string {
 	}
 	for _, v := range append(append([]string{}, l.Env...), phase...) {
 		out = append(out, expand(v))
+	}
+	return out
+}
+
+// proxyDirs are the directories a file:// GOPROXY names, to be bound read-only
+// into the fetch jail.
+//
+// Without them a file:// proxy is a configuration the daemon ACCEPTS and can
+// never read: the jail binds an allow-list of host paths, the proxy is not on
+// it, and `go mod download` reports a module that does not exist. That is a real
+// deployment — an air-gapped mirror on a PVC — and it is also what the hermetic
+// acceptance test uses, which is why that test could only ever pass unjailed.
+//
+// GOPROXY is a comma-separated list and may name several.
+func proxyDirs(goproxy string) []string {
+	var out []string
+	for _, p := range strings.Split(goproxy, ",") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(p), "file://"); ok && rest != "" {
+			out = append(out, filepath.FromSlash(rest))
+		}
 	}
 	return out
 }
