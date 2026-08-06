@@ -266,11 +266,34 @@ container; the gVisor target can).
    `apps/code` — one tree read, not a second checkout), `Gate`/`MeterUsage`
    (prepare price on cold, query price on warm), then POST to
    `lsp.hanzo.svc:8000`. On `409 {"need":"tree"}`, POST `/root` and retry once.
-2. **universe Deployment.** `ghcr.io/hanzoai/lsp` on a gvisor node pool (scale
-   the gvisor-installer DaemonSet up), `runtimeClassName: gvisor`, non-root,
-   RO rootfs, all capabilities dropped, no service-account token, a PVC for
-   `/var/lib/lsp`, an emptyDir for `/tmp`, and a NetworkPolicy whose egress
-   allowlist is the module proxy and nothing else. `LSP_KEY` from a KMSSecret.
+2. **universe Deployment.** DECLARED — `hanzoai/universe`
+   `charts/app/values/hanzo/lsp.yaml`: `runtimeClassName: gvisor`, non-root at
+   uid 65532, RO rootfs, all capabilities dropped, no service-account token,
+   seccomp RuntimeDefault, a 20Gi PVC for `/var/lib/lsp`, an emptyDir for
+   `/tmp`, and an egress policy. `LSP_KEY` comes from `hanzo/lsp/LSP_KEY@prod`
+   through the `lsp-env-kms-sync` KMSSecret; the same secret is read by cloud,
+   so the proxy's `X-API-Key` and the daemon's key are one value, not a pair.
+   Devs do not `kubectl apply` it — cd.hanzo.ai syncs that file.
+
+   THREE THINGS GATE IT RUNNING, and none is code here:
+
+   * **gVisor is installed on no node.** `gvisor-installer` has been 0/0/0 for
+     over a month — its nodeSelector named a pool that does not exist. The fix
+     is committed (`infra/k8s/gvisor`, re-pointed at `worker-pool`) but the
+     `universe` Application that owns `infra/k8s` is manual-sync, so nothing has
+     applied it. Until it does, `runtimeClassName: gvisor` is a promise the
+     cluster cannot keep.
+   * **The pool cannot hold this pod.** worker-pool is s-4vcpu-8gb — ~6.2Gi
+     allocatable against the 8Gi this daemon asks for. runsc has to be installed
+     somewhere larger, or lsp gets its own pool.
+   * **The image.** CI is `.hanzo/workflows/cicd.yml` → `hanzoai/ci` on the
+     git.hanzo.ai runners, publishing `ghcr.io/hanzoai/lsp`. The values file
+     carries tag AND digest, bumped in a reviewed commit.
+
+   Note what does NOT gate it: a wrong node, a missing RuntimeClass or a kernel
+   that will not make a user namespace are all survivable, because the boot-time
+   probe refuses to be ready and the Service keeps no endpoints. The daemon
+   never parses tenant bytes outside a jail it has watched work.
 3. **MCP.** EXTEND the existing single `lsp` tool (`mcp/rust/src/tools/lsp_tool.rs`,
    `python-sdk/pkg/hanzo-tools-lsp`) with `repo`/`rev` parameters — a file goes
    to the local stdio server, a repo goes to `/v1/code/lsp/*`. Not a new tool.
