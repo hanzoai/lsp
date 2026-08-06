@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -66,18 +67,30 @@ func command(ctx context.Context, p phase, s Spec) *exec.Cmd {
 }
 
 // Child runs the jail-child path and never returns, if this process IS a jail
-// child. In the daemon process it does nothing. main() calls it first, before any
-// server setup, so the child stays minimal.
+// child or the canary. In the daemon process it does nothing. main() calls it
+// first, before any server setup, so the child stays minimal.
 func Child() {
+	// The canary, which a jail EXECS. It reports whether the kernel would hand it
+	// a socket and exits. Because it is reached by exec — the same way a language
+	// server is reached — a jail that builds perfectly and then cannot exec fails
+	// the self-test, instead of passing it from inside the process that built it.
+	if len(os.Args) == 2 && os.Args[1] == canary {
+		if fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0); err != nil {
+			fmt.Println(canaryDeny, err)
+		} else {
+			syscall.Close(fd)
+			fmt.Println(canaryOK)
+		}
+		os.Exit(0)
+	}
 	p := phase(os.Getenv(envPhase))
 	if p != fetch && p != serve {
 		return
 	}
 	if err := run(p); err != nil {
 		fmt.Fprintln(os.Stderr, "jail:", err)
-		os.Exit(setupFailed)
 	}
-	os.Exit(setupFailed) // run() execs on success; arriving here means exec failed
+	os.Exit(setupFailed) // run() execs on success; arriving here means it did not
 }
 
 // run executes inside the new namespaces, as root within its own user namespace
@@ -99,8 +112,7 @@ func run(p phase) error {
 		return errors.New("missing root or work")
 	}
 	argv := split(os.Getenv(envArgv))
-	canary := os.Getenv(envCanary) == "1"
-	if len(argv) == 0 && !canary {
+	if len(argv) == 0 {
 		return errors.New("empty argv")
 	}
 
@@ -117,42 +129,12 @@ func run(p phase) error {
 		return fmt.Errorf("mount root: %w", err)
 	}
 
-	// (b) Bind what the caller allowed, EACH AT ITS OWN ABSOLUTE PATH.
-	//
-	// Same-path is not a convenience. A language server reports every answer as a
-	// file: URI of a path it was given, so a jail that renamed /roots/x to /work
-	// would hand the caller paths that name nothing — or would need a translation
-	// table, which is a second place for the two sides to disagree. There is no
-	// translation here because there is nothing to translate.
-	//
-	// Serve binds EVERYTHING read-only, including the working tree: a root is
-	// immutable and a language server has no business writing to one. Fetch binds
-	// Work and Write read-write, because populating a dependency cache is
-	// precisely what it is for.
-	for _, path := range split(os.Getenv(envRead)) {
-		if err := bind(path, root, false); err != nil {
+	// (b) Fill it, in the order plan() put things in.
+	for _, m := range plan(p, work, split(os.Getenv(envRead)),
+		split(os.Getenv(envWrite)), num(envTmp, 256)) {
+		if err := m.make(root); err != nil {
 			return err
 		}
-	}
-	writable := p == fetch
-	for _, path := range split(os.Getenv(envWrite)) {
-		if err := bind(path, root, writable); err != nil {
-			return err
-		}
-	}
-	if err := bind(work, root, writable); err != nil {
-		return err
-	}
-	// A writable tmpfs /tmp: the ONLY thing a served process can write, and it
-	// dies with the process. Build caches live here for exactly that reason.
-	tmp := filepath.Join(root, "tmp")
-	if err := os.MkdirAll(tmp, 0o1777); err != nil {
-		return fmt.Errorf("mkdir /tmp: %w", err)
-	}
-	size := num(envTmp, 256)
-	if err := syscall.Mount("tmpfs", tmp, "tmpfs", 0,
-		fmt.Sprintf("mode=1777,size=%dm", size)); err != nil {
-		return fmt.Errorf("mount /tmp: %w", err)
 	}
 
 	// (c) Enter it. The old root is gone; work is reachable at the same path it
@@ -180,26 +162,117 @@ func run(p phase) error {
 		return err
 	}
 
-	// (e) Either prove the boundary to ourselves, or become the program.
-	if canary {
-		probe()
-		os.Exit(0)
-	}
+	// (e) Become the program. There is no other ending — the canary is a program
+	// like any other, so the exec is on the path the self-test proves.
 	if err := syscall.Exec(argv[0], argv, clean()); err != nil {
 		return fmt.Errorf("exec %s: %w", argv[0], err)
 	}
 	return nil // unreachable
 }
 
-// bind mounts src inside the staging root at src's own path. A missing source is
-// skipped: the bind list is the superset across image layouts, and a host that
-// lacks /lib64 must not fail to jail.
-func bind(src, root string, write bool) error {
-	fi, err := os.Stat(src)
-	if err != nil {
+// ── what the jail's filesystem is ────────────────────────────────────────────
+
+// mount is one line of that filesystem, as a value: what appears at path inside
+// the jail, and whether the program may write it. An empty src means a fresh
+// tmpfs of size MiB rather than a bind of a host path.
+//
+// path is ALWAYS the source's own absolute path. Same-path is not a convenience:
+// a language server reports every answer as a file: URI of a path it was given,
+// so a jail that renamed /roots/x to /work would hand the caller paths that name
+// nothing — or would need a translation table, which is a second place for the
+// two sides to disagree. There is nothing to translate here.
+type mount struct {
+	src   string // the host path to bind; empty ⇒ a fresh tmpfs
+	path  string // absolute, and the same inside the jail as outside
+	size  uint64 // MiB, for a tmpfs
+	write bool   // may the jailed program write it
+	must  bool   // a missing source is an error rather than a skip
+}
+
+// plan is the whole filesystem the jail will have, ORDERED SHALLOWEST PATH
+// FIRST — and that ordering is the reason this is a value rather than a run of
+// mount calls.
+//
+// A mount whose path is an ANCESTOR of an earlier one covers it. Nothing fails
+// at the time: the earlier mount is still there, and simply cannot be seen. The
+// child fails much later, on chdir or exec, with ENOENT on a path that plainly
+// exists outside the jail. That was this daemon's boot self-test — the writable
+// /tmp was mounted AFTER the binds, so every bind under /tmp was placed and then
+// erased, and /tmp is where the staging directory lives. The pod reported `exit
+// status 126` and refused every request, correctly, for a filesystem bug.
+//
+// Sorting by depth makes an ancestor-after-descendant order unrepresentable, so
+// the rule is enforced rather than remembered. TestThePlanHidesNothing asserts
+// it directly, needs no privileges, and would have caught this before it shipped.
+func plan(p phase, work string, read, write []string, tmp uint64) []mount {
+	// The jail's own writable /tmp: the ONLY thing a served process can write,
+	// and it dies with the process. Build caches live here for exactly that
+	// reason. Shallowest of all, so everything binds ON it.
+	ms := []mount{{path: "/tmp", size: tmp, write: true}}
+
+	// Serve binds EVERYTHING read-only, including the working tree: a root is
+	// immutable and a language server has no business writing to one. Fetch binds
+	// Work and Write read-write, because populating a dependency cache is
+	// precisely what it is for. That is the ONE difference, and it is this line.
+	writable := p == fetch
+	for _, src := range read {
+		ms = append(ms, mount{src: src, path: src})
+	}
+	for _, src := range write {
+		ms = append(ms, mount{src: src, path: src, write: writable})
+	}
+	// The working tree is the one path that is NOT optional. The read list is a
+	// superset across image layouts — a host without /lib64 must still jail — but
+	// a jail whose working tree is missing has nothing to chdir into, and saying
+	// so HERE names the cause instead of leaving a chdir to report the symptom.
+	ms = append(ms, mount{src: work, path: work, write: writable, must: true})
+
+	// ONE MOUNT PER PATH, and the first claim wins. Two mounts at one path are
+	// the same hiding as an ancestor mounted late, and the order above decides it
+	// the safe way: the jail's own /tmp is first, so a caller that asks to bind
+	// /tmp gets the private tmpfs that dies with the process rather than the
+	// host's directory. A boundary must not be overridable by an argument.
+	seen := make(map[string]bool, len(ms))
+	out := ms[:0]
+	for _, m := range ms {
+		if m.path == "" {
+			continue // an unconfigured cache is spelled ""
+		}
+		m.path = filepath.Clean(m.path)
+		if seen[m.path] {
+			continue
+		}
+		seen[m.path] = true
+		out = append(out, m)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return depth(out[i].path) < depth(out[j].path) })
+	return out
+}
+
+// depth is how many separators a cleaned absolute path has. An ancestor always
+// has strictly fewer than its descendants, which is all the sort needs.
+func depth(p string) int { return strings.Count(p, string(filepath.Separator)) }
+
+// make performs one line of the plan, inside the staging root.
+func (m mount) make(root string) error {
+	dst := filepath.Join(root, m.path)
+	if m.src == "" {
+		if err := os.MkdirAll(dst, 0o1777); err != nil {
+			return fmt.Errorf("mkdir %s: %w", m.path, err)
+		}
+		if err := syscall.Mount("tmpfs", dst, "tmpfs", 0,
+			fmt.Sprintf("mode=1777,size=%dm", m.size)); err != nil {
+			return fmt.Errorf("mount %s: %w", m.path, err)
+		}
 		return nil
 	}
-	dst := filepath.Join(root, src)
+	fi, err := os.Stat(m.src)
+	if err != nil {
+		if m.must {
+			return fmt.Errorf("bind %s: %w", m.src, err)
+		}
+		return nil
+	}
 	if fi.IsDir() {
 		err = os.MkdirAll(dst, 0o755)
 	} else {
@@ -211,17 +284,17 @@ func bind(src, root string, write bool) error {
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("bind target %s: %w", src, err)
+		return fmt.Errorf("bind target %s: %w", m.src, err)
 	}
-	if err := syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("bind %s: %w", src, err)
+	if err := syscall.Mount(m.src, dst, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind %s: %w", m.src, err)
 	}
-	if write {
+	if m.write {
 		return nil
 	}
 	// A bind acquires read-only only on a second, remounting call.
 	if err := syscall.Mount("", dst, "", syscall.MS_BIND|syscall.MS_REC|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
-		return fmt.Errorf("seal %s: %w", src, err)
+		return fmt.Errorf("seal %s: %w", m.src, err)
 	}
 	return nil
 }
@@ -281,30 +354,27 @@ func num(key string, def uint64) uint64 {
 	return def
 }
 
-// ── the canary ───────────────────────────────────────────────────────────────
+// ── the boot self-test ───────────────────────────────────────────────────────
 
-// probe runs INSIDE a fully built jail, after the filter is installed, on the
-// thread the filter was installed on (run() locked it). It asks the kernel for a
-// socket and reports what happened. That is the daemon proving the invariant
-// about ITSELF on THIS host, rather than asserting it in a comment.
-func probe() {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		fmt.Println(canaryDeny, err)
-		return
-	}
-	syscall.Close(fd)
-	fmt.Println(canaryOK)
-}
+// ErrHost reports that this host cannot create the namespaces a jail needs: the
+// child never started. Every OTHER Probe failure means the child DID start and
+// the jail itself is wrong, and the two must never be read as one — a caller
+// that tolerates the first would otherwise tolerate the second and certify
+// nothing. On the target, both are fatal; only a test may skip on this one.
+var ErrHost = errors.New("jail: this host cannot create namespaces")
 
-// Probe builds a real jail in each phase and makes the canary tell it whether a
-// socket was obtainable. It is the boot self-test, and it is the reason /readyz
-// can be trusted: a host where the namespaces cannot be created, or where the
-// filter did not take, fails here and the daemon then refuses every request
-// rather than serving untrusted bytes next to a network.
+// Probe builds a real jail in each phase, EXECS the canary in it, and makes it
+// say whether a socket was obtainable. It is the boot self-test, and it is the
+// reason /readyz can be trusted: a host where the namespaces cannot be created,
+// where a mount is masked, where the exec cannot happen or where the filter did
+// not take fails here, and the daemon then refuses every request rather than
+// serving untrusted bytes next to a network.
 //
-// root and work are scratch directories the caller owns.
-func Probe(ctx context.Context, root, work string) error {
+// root is the staging base, and it is the ONLY path this takes. The canary's
+// working tree is the directory the canary lives in, so there is no second
+// directory to get into the wrong relationship with the first — which is exactly
+// the mistake that made this self-test fail on every host it ran on.
+func Probe(ctx context.Context, root string) error {
 	if !Supported() {
 		return errors.New("jail: unsupported on this build")
 	}
@@ -315,14 +385,34 @@ func Probe(ctx context.Context, root, work string) error {
 		{serve, canaryDeny},
 		{fetch, canaryOK},
 	} {
-		spec := Spec{
-			Root: root, Work: work,
-			Env:    []string{envCanary + "=1"},
-			Limits: Limits{AddrMiB: 1024, CPU: 10, Nofile: 64, Nproc: 32, TmpMiB: 16},
-		}
-		out, err := command(ctx, c.p, spec).Output()
+		out, err := command(ctx, c.p, Spec{
+			Root: root,
+			Work: filepath.Dir(self),
+			Argv: []string{self, canary},
+			// GENEROUS ON PURPOSE. A ceiling that stops the canary starting takes
+			// the daemon out of service without any boundary having failed, which
+			// is the worst answer a self-test can give. RLIMIT_NPROC especially:
+			// it is per-UID, so the jailed process shares its budget with the
+			// daemon's own threads — measured on the target, 32 leaves a Go
+			// program unable to start a third thread, and that reads exactly like
+			// a broken jail. Ceilings are proven by the phases that use them.
+			Limits: Limits{AddrMiB: 4096, CPU: 10, Nofile: 256, Nproc: 256, TmpMiB: 16},
+		}).Output()
 		if err != nil {
-			return fmt.Errorf("jail: %s canary did not run: %w", c.p, err)
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
+				return fmt.Errorf("%w: %v", ErrHost, err)
+			}
+			// THE CHILD ALREADY SAID WHY. run() writes "jail: <reason>" to stderr
+			// and exits 126; Output() parks that on ExitError.Stderr, and this
+			// function used to drop it and report only "exit status 126".
+			//
+			// That number is not a diagnosis. It is the same code for a missing
+			// mount, an unmappable uid, a chroot that failed and a chdir into a
+			// masked path — and it was all an operator got for a pod that would
+			// not go ready. Never report an exit status without the words beside it.
+			return fmt.Errorf("jail: %s canary did not run: %w: %s",
+				c.p, err, strings.TrimSpace(string(ee.Stderr)))
 		}
 		got := strings.TrimSpace(string(out))
 		if !strings.HasPrefix(got, c.want) {

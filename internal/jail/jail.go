@@ -128,7 +128,6 @@ const (
 	envNofile = "HANZO_JAIL_NOFILE" //
 	envNproc  = "HANZO_JAIL_NPROC"  //
 	envTmp    = "HANZO_JAIL_TMP"    //
-	envCanary = "HANZO_JAIL_CANARY" // "1" ⇒ the child probes itself instead of exec'ing
 )
 
 // envPrefix is what the child strips: one prefix covers every control variable,
@@ -163,6 +162,18 @@ func control(p phase, s Spec) []string {
 // It is distinct from anything the jailed program would return, so a sandbox
 // failure is never read as a program result.
 const setupFailed = 126
+
+// ── the canary ───────────────────────────────────────────────────────────────
+
+// canary is the single argument that makes this binary report whether the kernel
+// would hand it a socket, and then exit. Probe jails it and reads what it says.
+//
+// AN ARGUMENT, NOT A VARIABLE, and that is forced: the child STRIPS every
+// HANZO_JAIL variable before exec'ing, so nothing in the control environment can
+// survive into the program. The canary has to be reachable the way the program
+// is reached — through argv — which is the point. It is exec'd across the same
+// boundary a language server crosses, so it proves the exec, not just the filter.
+const canary = "canary"
 
 // canaryOK is what the canary prints when it could open a socket, and canaryDeny
 // what it prints when the kernel refused. Probe reads exactly these.

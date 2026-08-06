@@ -36,7 +36,12 @@ func command(ctx context.Context, _ phase, s Spec) *exec.Cmd {
 // Child is a no-op: nothing re-execs, so nothing is ever a jail child.
 func Child() {}
 
+// ErrHost has no meaning here: there is no host that could create the
+// namespaces, because there are none to create. It exists so callers can name
+// the one Probe failure that is about the machine rather than the jail.
+var ErrHost = errors.New("jail: this host cannot create namespaces")
+
 // Probe cannot prove a boundary that is not there.
-func Probe(context.Context, string, string) error {
+func Probe(context.Context, string) error {
 	return errors.New("jail: unsupported on this platform")
 }

@@ -4,9 +4,28 @@ package jail
 
 import (
 	"context"
+	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain gives the test binary the daemon's own first line.
+//
+// WITHOUT IT NO JAIL TEST CAN PASS. A jail re-execs `self`, and under `go test`
+// self is the TEST BINARY, whose main is testing's rather than the daemon's — so
+// the child re-ran the whole suite, printed "PASS", and the canary compared
+// "PASS" against "socket=denied". Probe then reported that the phase boundary
+// was not in force, and the test skipped, blaming the host.
+//
+// That is the worst shape a security test can have: honest-looking environmental
+// scepticism that is structurally incapable of running. main() calls Child()
+// first thing for this exact reason; the test binary has to do the same.
+func TestMain(m *testing.M) {
+	Child()
+	os.Exit(m.Run())
+}
 
 // TestFilterIsTheBoundary interprets the cBPF program exactly as the kernel's
 // engine would and pins, for BOTH phases, the three things the filter exists to
@@ -78,20 +97,123 @@ func TestPhasesDifferOnlyByTheNetwork(t *testing.T) {
 	}
 }
 
-// TestProbeProvesTheBoundaryOnThisHost runs the REAL jail in both phases and
-// makes the canary report whether the kernel handed it a socket. It needs a host
-// that can create a user namespace — gVisor's sentry can, a plain CI container
-// cannot — so it SKIPS off-target rather than failing. On the target it is the
-// difference between a sandbox and a comment about one.
+// TestThePlanHidesNothing is the bug this daemon shipped with, as an assertion
+// that needs no kernel and no privileges at all.
+//
+// A mount whose path is an ANCESTOR of an earlier one covers it. Nothing fails
+// when it happens — the earlier mount is still there and simply cannot be seen —
+// so the child dies later, on chdir or exec, with ENOENT on a path that plainly
+// exists outside the jail. The writable /tmp used to be mounted AFTER the binds,
+// which erased every bind under /tmp; the staging directory lives under /tmp, and
+// so does a `go test` binary, so the self-test masked its own working tree,
+// exited 126, and took the whole daemon out of service.
+//
+// The cases below are the real shapes: a working tree under /tmp, a cache under
+// /tmp, and paths at every depth. If anyone reorders plan() so that a later mount
+// can swallow an earlier one, this fails here rather than on a node.
+func TestThePlanHidesNothing(t *testing.T) {
+	for _, p := range []phase{serve, fetch} {
+		for _, work := range []string{"/tmp/jail/work", "/var/lib/lsp/roots/x", "/tmp"} {
+			ms := plan(p, work,
+				[]string{"/usr/local/go", "/etc/ssl/certs", "/tmp/toolchain", "/lib"},
+				[]string{"/tmp/deps/go", "/var/lib/lsp/deps"}, 16)
+			for i, m := range ms {
+				for _, before := range ms[:i] {
+					if covers(m.path, before.path) {
+						t.Fatalf("%s work=%s: %s is mounted after %s and hides it",
+							p, work, m.path, before.path)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestThePlanIsThePhase pins the filesystem half of the invariant the two phases
+// exist to keep, and the one path that is not optional.
+func TestThePlanIsThePhase(t *testing.T) {
+	const work, cache, tool = "/var/lib/lsp/roots/x", "/var/lib/lsp/deps/go", "/usr/local/go"
+	for _, c := range []struct {
+		p     phase
+		write bool
+	}{{serve, false}, {fetch, true}} {
+		var sawWork, sawTmp bool
+		for _, m := range plan(c.p, work, []string{tool}, []string{cache}, 16) {
+			switch m.path {
+			case "/tmp":
+				// The jail's own scratch: writable in BOTH phases, and it is the
+				// only thing a served process may write.
+				sawTmp = true
+				if !m.write || m.src != "" {
+					t.Fatalf("%s: /tmp must be a writable tmpfs, got %+v", c.p, m)
+				}
+			case work:
+				sawWork = true
+				if !m.must {
+					t.Fatalf("%s: the working tree must be required, not skipped when absent", c.p)
+				}
+				fallthrough
+			case cache:
+				if m.write != c.write {
+					t.Fatalf("%s: %s writable = %v, want %v", c.p, m.path, m.write, c.write)
+				}
+			default:
+				if m.write {
+					t.Fatalf("%s: %s is writable and nothing but the tree and the cache may be",
+						c.p, m.path)
+				}
+			}
+		}
+		if !sawWork || !sawTmp {
+			t.Fatalf("%s: plan is missing the working tree or /tmp", c.p)
+		}
+	}
+}
+
+// TestTheJailKeepsItsOwnTmp pins a boundary that must not be reachable from an
+// argument. The jail's /tmp is a private tmpfs that dies with the process and is
+// the only thing a served program may write; a caller naming /tmp as a tree or a
+// cache must not be able to swap the host's directory in for it.
+func TestTheJailKeepsItsOwnTmp(t *testing.T) {
+	for _, m := range plan(fetch, "/tmp", []string{"/tmp"}, []string{"/tmp"}, 16) {
+		if m.path == "/tmp" && m.src != "" {
+			t.Fatalf("a caller replaced the jail's private /tmp with a bind of %s", m.src)
+		}
+	}
+}
+
+// TestProbeProvesTheBoundaryOnThisHost runs the REAL jail in both phases, EXECS
+// the canary inside it, and makes it report whether the kernel handed it a
+// socket. It is the difference between a sandbox and a comment about one.
+//
+// IT SKIPS FOR EXACTLY ONE REASON: this host cannot create the namespaces, which
+// a plain CI container cannot and gVisor's sentry can. Every other failure is
+// this repository's and FAILS. That distinction is the test — it used to skip on
+// any error at all, so a jail that built and then did not work reported itself as
+// "not the target" and nobody ever saw it. Exit 126 skipped here for weeks.
+//
+// TestMain above is what lets it run: the jail re-execs `self`, which under
+// `go test` is the test binary, and self-exec'ing a test suite proves nothing.
+// Both `self` and the canary's working tree are under /tmp here, so this is also
+// the on-target guard against the masking bug TestThePlanHidesNothing pins.
 func TestProbeProvesTheBoundaryOnThisHost(t *testing.T) {
 	if !Supported() {
 		t.Skip("no jail on this build")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := Probe(ctx, t.TempDir()+"/stage", t.TempDir()); err != nil {
-		t.Skipf("the jail cannot initialize here (expected off the gVisor target): %v", err)
+	if err := Probe(ctx, t.TempDir()); err != nil {
+		if errors.Is(err, ErrHost) {
+			t.Skipf("this host cannot create namespaces, as expected off the gVisor target: %v", err)
+		}
+		t.Fatalf("the jail built on this host and did not work: %v", err)
 	}
+}
+
+// covers reports whether a is b or an ancestor of it. Paths are cleaned by
+// plan(), so this is a path comparison and not a string one: /ab is not under /a.
+func covers(a, b string) bool {
+	return a == b || strings.HasPrefix(b, strings.TrimSuffix(a, "/")+"/")
 }
 
 // interpreter returns a function that runs prog against a synthetic (arch, nr)

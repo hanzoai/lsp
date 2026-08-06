@@ -43,11 +43,37 @@ executing in the one phase that has a network.
 ## Fail closed
 
 On Linux the jail is REQUIRED. At boot the daemon runs `jail.Probe`, which
-builds a real jail in each phase and makes a canary ask the kernel for a socket:
-serving must be refused one, fetching must get one. If that does not hold —
-no gVisor RuntimeClass, no user namespace — `/readyz` is 503 and every request
-that would run a language server is refused. There is no environment variable
-that turns the jail off, so there is none that can be set by accident.
+builds a real jail in each phase and **execs** a canary in it — `lsp canary`,
+this same binary — which asks the kernel for a socket and says what happened:
+serving must be refused one, fetching must get one. Reaching the canary by exec
+is the point: a jail that builds perfectly and then cannot exec fails the
+self-test instead of passing it from inside the process that built it. If any of
+that does not hold — no gVisor RuntimeClass, no user namespace, a masked mount,
+a filter that did not take — `/readyz` is 503 and every request that would run a
+language server is refused. There is no environment variable that turns the jail
+off, so there is none that can be set by accident.
+
+### The mount order is the boundary too
+
+The jail's filesystem is a VALUE — `plan()` in `internal/jail/jail_linux.go` —
+ordered shallowest path first, with one mount per path and the jail's own `/tmp`
+claiming that path before any caller can.
+
+That ordering is not a detail. A mount whose path is an ancestor of an earlier
+one covers it, and nothing fails when it happens: the earlier mount is still
+there and simply cannot be seen. The daemon shipped with the writable `/tmp`
+mounted AFTER the binds, which erased every bind under `/tmp` — and `/tmp` is
+where the staging directory lives. The boot self-test masked its own working
+tree, `chdir` returned ENOENT, the child exited 126, and `/readyz` was 503 on
+every host. Nothing about the boundary was wrong; the filesystem was built in an
+order that hid part of it.
+
+Sorting by depth makes an ancestor-after-descendant order unrepresentable, and
+`TestThePlanHidesNothing` asserts it with no kernel and no privileges.
+
+**Any fork of this jailer has the same bug** — it was copied from
+hanzoai/code-exec's `internal/codeexec/jail_linux.go`, which orders its mounts
+the same way. See the CTO call below: this belongs in one module, not two files.
 
 Off Linux there is no jail to require, and the daemon says so loudly in the log
 and on `/readyz`. The image is linux/amd64, so that case is a developer's
@@ -252,9 +278,18 @@ installed.
 
 The jail tests interpret the cBPF program the way the kernel would, so the jump
 arithmetic — where an off-by-one silently ALLOWS a denied syscall — is checked
-on any Linux with no privileges. `TestProbeProvesTheBoundaryOnThisHost` runs the
-real thing and skips where a user namespace cannot be created (a plain CI
-container; the gVisor target can).
+on any Linux with no privileges. `TestThePlanHidesNothing`, `TestThePlanIsThePhase`
+and `TestTheJailKeepsItsOwnTmp` check the filesystem half of the boundary the
+same way: no kernel, no privileges, no skip.
+
+`TestProbeProvesTheBoundaryOnThisHost` runs the real thing and **skips for
+exactly one reason**: this host cannot create the namespaces (`jail.ErrHost`),
+which a plain CI container cannot and the gVisor target can. Every other failure
+is this repository's and fails the build. It used to skip on any error at all,
+so a jail that built and then did not work reported itself as "not the target" —
+exit 126 skipped there for as long as it existed. `TestMain` in both test
+packages takes the jail-child path, without which a jail re-execs the TEST
+BINARY and a self-exec'd test suite proves nothing.
 
 ## Phase 2
 
