@@ -1,0 +1,82 @@
+# lsp — the ONE file that says how this repo builds, gates and ships.
+#
+# The only workflow is `.hanzo/workflows/cicd.yml`, ~10 lines that import
+# hanzoai/ci. Everything real is here, and platform.hanzo.ai reads this same
+# file, so there is one description of this build rather than one per front door.
+
+# The gates run DIRECTLY on the runner, not inside the image build, so a failure
+# names the test that failed instead of a layer that exited 1.
+#
+# CGO_ENABLED=0 on every gate because that is how the daemon ships: the
+# Dockerfile builds `CGO_ENABLED=0` and the jail child re-execs THAT binary. A
+# cgo build links a different program than the one under test.
+#
+# GOWORK=off so a go.work in a parent directory cannot change which modules
+# resolve — CI must read this repo's go.mod and nothing else.
+test:
+  - name: go-build
+    # First and cheapest: a compile error fails here in seconds with one message
+    # rather than as package-level noise under vet.
+    run: |
+      set -e
+      export GOWORK=off CGO_ENABLED=0
+      go build ./...
+
+  - name: go-vet
+    run: |
+      set -e
+      export GOWORK=off CGO_ENABLED=0
+      go vet ./...
+
+  - name: go-test
+    # THE RUNNER IS LINUX, and that is the point. `internal/jail` is
+    # build-tagged linux, so the cBPF gates — which interpret the seccomp
+    # program the way the kernel would, where an off-by-one in the jump
+    # arithmetic silently ALLOWS a denied syscall — only ever execute here. On a
+    # developer's mac the whole package reports "no test files".
+    #
+    # gopls is INSTALLED FIRST, at the version the image pins, because
+    # internal/lsp/gopls_test.go skips itself when gopls is not on PATH — and
+    # that test is the acceptance test: it publishes a module into a directory
+    # laid out as a Go module proxy, points the fetch phase at it with
+    # GOPROXY=file:// so the real `go mod download` runs with no network, and
+    # requires `locate definition` to come back external at the module
+    # coordinate. Without the install the gate is green over a skip, which is
+    # the one failure mode a gate exists to refuse.
+    #
+    # The version is READ FROM THE DOCKERFILE rather than repeated here. Two
+    # copies of a pin are right twice and then wrong once, and the wrong once is
+    # a CI that certifies a language server the image does not run.
+    #
+    # TestProbeProvesTheBoundaryOnThisHost also runs here and SKIPS where a user
+    # namespace cannot be created, which a plain CI container cannot. That skip
+    # is honest and is why the probe is re-run at boot on the real node: see
+    # main.go's svc.Prove and /readyz.
+    run: |
+      set -e
+      export GOWORK=off CGO_ENABLED=0
+      gopls_version=$(sed -nE 's/^ARG GOPLS_VERSION=(.+)$/\1/p' Dockerfile | head -1)
+      test -n "$gopls_version"
+      go install "golang.org/x/tools/gopls@${gopls_version}"
+      export PATH="$(go env GOPATH)/bin:$PATH"
+      command -v gopls
+      go test -count=1 ./...
+
+images:
+  - name: lsp
+    context: .
+    dockerfile: Dockerfile
+    repo: ghcr.io/hanzoai/lsp
+    # amd64 only: the cluster has no arm64 nodes, and the gVisor RuntimeClass
+    # this daemon requires is installed on amd64 nodes. Adding an arch here
+    # means QEMU-emulating a full Go build plus a gopls build for a consumer
+    # that does not exist. Add linux/arm64 when something pulls it.
+    platforms: [linux/amd64]
+
+# No `deploy:` ON PURPOSE.
+#
+# Which build runs is a REVIEWED change in hanzoai/universe —
+# charts/app/values/hanzo/lsp.yaml, tag plus digest — synced by cd.hanzo.ai.
+# This daemon runs third-party language servers over tenant source behind a
+# jail, so "which binary is behind that jail" is the last thing that should move
+# as a CI side effect. CI's job ends at "the tag exists and resolves".
