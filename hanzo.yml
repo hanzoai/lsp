@@ -76,7 +76,7 @@ test:
 # a number at or below what is published publishes the next patch above the
 # registry. So this line is the floor, not the output, and it can never mint a
 # tag that already covers different bytes.
-version: 0.1.4
+version: 0.1.5
 
 images:
   - name: lsp

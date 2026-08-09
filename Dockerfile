@@ -19,7 +19,7 @@
 # linux/amd64.
 
 # ── 1. The daemon ────────────────────────────────────────────────────────────
-FROM golang:1.26.4-bookworm AS build
+FROM golang:1.26.5-bookworm AS build
 WORKDIR /src
 # Module graph first for layer caching. There are no dependencies today — stdlib
 # only, by design — but this keeps the shape right if one is ever added.
@@ -40,7 +40,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 # Phase 1 ships Go only. Adding a language is: install its server below, and
 # internal/lsp/langs.go already carries the entry — Lang.Available() lights it up
 # at runtime with no code change.
-FROM golang:1.26.4-bookworm AS tools
+FROM golang:1.26.5-bookworm AS tools
 ARG GOPLS_VERSION=v0.23.0
 RUN GOBIN=/out CGO_ENABLED=0 go install golang.org/x/tools/gopls@${GOPLS_VERSION}
 
@@ -55,8 +55,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The Go toolchain, which gopls shells out to for `go list` and which the fetch
 # phase runs as `go mod download`. A pinned tarball rather than apt: Debian's
-# golang lags, and the toolchain version decides which repositories resolve.
-ARG GO_VERSION=1.26.4
+# golang lags, and the toolchain version decides which repositories resolve —
+# GOTOOLCHAIN=local (langs.go) never downloads a newer one, so a repo whose
+# go.mod names a Go past this pin degrades to unresolved imports. Kept at the
+# latest 1.26.x so the fleet's own repos (cloud requires 1.26.5) resolve; bump
+# this line when a repo needs a newer one.
+ARG GO_VERSION=1.26.5
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in amd64) goarch=amd64 ;; arm64) goarch=arm64 ;; *) echo "unsupported arch $arch"; exit 1 ;; esac; \
