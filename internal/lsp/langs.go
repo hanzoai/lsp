@@ -185,7 +185,7 @@ var table = map[string]Lang{
 		// in, and tsserver reads both. Leaving them out meant a package that
 		// spells its entry point .mjs — an ordinary modern one — looked to
 		// Speaks() like a repository with no JavaScript in it at all.
-		Exts: []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"},
+		Exts:  []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"},
 		Cache: "npm",
 		// --ignore-scripts is the whole reason this fetch is allowed: it is npm's
 		// own switch for "place the tree, run none of its lifecycle hooks". The

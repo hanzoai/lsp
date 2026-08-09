@@ -41,36 +41,69 @@ func TestFilterIsTheBoundary(t *testing.T) {
 		// A different audit arch is KILLed whatever the number: the i386 ABI's
 		// numbers mean other things and would sail past the compares below.
 		const auditArchI386 = 0x40000003
-		if got := eval(auditArchI386, 41); got != retKill {
+		if got := eval(call{arch: auditArchI386, nr: 41}); got != retKill {
 			t.Fatalf("%s: i386 arch = 0x%x, want KILL", p, got)
 		}
 		// Every denied number reaches the ERRNO terminal, and its x32 spelling is
 		// KILLed rather than slipping past the numeric compare.
 		for _, nr := range denied(p) {
-			if got := eval(auditArchAMD64, nr); got != retErrno {
+			if got := eval(call{arch: auditArchAMD64, nr: nr}); got != retErrno {
 				t.Fatalf("%s: denied nr %d = 0x%x, want ERRNO", p, nr, got)
 			}
-			if got := eval(auditArchAMD64, nr|x32Bit); got != retKill {
+			if got := eval(call{arch: auditArchAMD64, nr: nr | x32Bit}); got != retKill {
 				t.Fatalf("%s: x32 of denied nr %d = 0x%x, want KILL", p, nr, got)
 			}
 		}
 		// The x32 ABI is refused wholesale, not only for the denied numbers.
-		if got := eval(auditArchAMD64, 0|x32Bit); got != retKill {
+		if got := eval(call{arch: auditArchAMD64, nr: 0 | x32Bit}); got != retKill {
 			t.Fatalf("%s: x32 read = 0x%x, want KILL", p, got)
 		}
 		// read(0) and openat(257) are not denied — a toolchain's surface is wide
 		// and the filter must not become an allow-list of everything.
 		for _, nr := range []uint32{0, 257} {
-			if got := eval(auditArchAMD64, nr); got != retAllow {
+			if got := eval(call{arch: auditArchAMD64, nr: nr}); got != retAllow {
 				t.Fatalf("%s: nr %d = 0x%x, want ALLOW", p, nr, got)
 			}
 		}
 		// io_uring is denied in BOTH phases: a socket-only deny is not egress
 		// containment, because IORING_OP_SOCKET issues no socket() syscall.
 		for _, nr := range []uint32{sysIoUringSetup, sysIoUringEnter, sysIoUringRegister} {
-			if got := eval(auditArchAMD64, nr); got != retErrno {
+			if got := eval(call{arch: auditArchAMD64, nr: nr}); got != retErrno {
 				t.Fatalf("%s: io_uring nr %d = 0x%x, want ERRNO", p, nr, got)
 			}
+		}
+	}
+}
+
+// TestSocketpairIsDecidedByItsFamily pins the one place this filter reads an
+// ARGUMENT, in both phases.
+//
+// AF_UNIX has to pass or Node cannot start a child at all — libuv gives a child
+// its stdio through a socketpair, so denying it cost TypeScript its server
+// rather than costing anyone a network. Every other family has to fail, or the
+// claim that no fd to a network exists stops being a property of this program
+// and becomes a fact about which families the kernel implements.
+//
+// The two edges of that compare are the whole test: they are hand-computed
+// offsets over a list whose length changes with the phase, so an off-by-one
+// here reads as ALLOW for a family that should be refused.
+func TestSocketpairIsDecidedByItsFamily(t *testing.T) {
+	for _, p := range []phase{serve, fetch} {
+		eval := interpreter(t, filter(p))
+
+		if got := eval(call{arch: auditArchAMD64, nr: syscall.SYS_SOCKETPAIR, arg0: afUnix}); got != retAllow {
+			t.Errorf("%s: socketpair(AF_UNIX) = 0x%x, want ALLOW — a language server cannot fork without it", p, got)
+		}
+		// AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, and a family nobody named.
+		for _, family := range []uint32{0, 2, 10, 16, 17, 40} {
+			if got := eval(call{arch: auditArchAMD64, nr: syscall.SYS_SOCKETPAIR, arg0: family}); got != retErrno {
+				t.Errorf("%s: socketpair(family %d) = 0x%x, want ERRNO", p, family, got)
+			}
+		}
+		// The carve-out is for socketpair alone: socket() is still how a network
+		// fd is obtained, and the serve phase still refuses it whatever it names.
+		if got := eval(call{arch: auditArchAMD64, nr: syscall.SYS_SOCKET, arg0: afUnix}); p == serve && got != retErrno {
+			t.Errorf("serve: socket(AF_UNIX) = 0x%x, want ERRNO — the carve-out must not have widened to socket", got)
 		}
 	}
 }
@@ -83,16 +116,17 @@ func TestPhasesDifferOnlyByTheNetwork(t *testing.T) {
 	fetchEval := interpreter(t, filter(fetch))
 
 	for _, nr := range network {
-		if got := serveEval(auditArchAMD64, nr); got != retErrno {
+		if got := serveEval(call{arch: auditArchAMD64, nr: nr}); got != retErrno {
 			t.Fatalf("serve: nr %d = 0x%x, want ERRNO — an untrusted process could open a socket", nr, got)
 		}
-		if got := fetchEval(auditArchAMD64, nr); got != retAllow {
+		if got := fetchEval(call{arch: auditArchAMD64, nr: nr}); got != retAllow {
 			t.Fatalf("fetch: nr %d = 0x%x, want ALLOW — the fetch phase could not download", nr, got)
 		}
 	}
 	// Everything else agrees.
 	for _, nr := range escape {
-		if serveEval(auditArchAMD64, nr) != retErrno || fetchEval(auditArchAMD64, nr) != retErrno {
+		if serveEval(call{arch: auditArchAMD64, nr: nr}) != retErrno ||
+			fetchEval(call{arch: auditArchAMD64, nr: nr}) != retErrno {
 			t.Fatalf("nr %d is not denied in both phases", nr)
 		}
 	}
@@ -279,20 +313,35 @@ func covers(a, b string) bool {
 	return a == b || strings.HasPrefix(b, strings.TrimSuffix(a, "/")+"/")
 }
 
-// interpreter returns a function that runs prog against a synthetic (arch, nr)
-// the way the kernel's cBPF engine does, for the four opcodes this filter uses.
-func interpreter(t *testing.T, prog []insn) func(arch, nr uint32) uint32 {
+// call is one synthetic seccomp_data — the kernel's input to the filter, named
+// rather than passed as a growing list of positions, because the filter now
+// reads an ARGUMENT and a caller that got arch and arg0 the wrong way round
+// would still compile.
+type call struct {
+	arch uint32
+	nr   uint32
+	arg0 uint32
+}
+
+// interpreter returns a function that runs prog against one call the way the
+// kernel's cBPF engine does, for the four opcodes this filter uses.
+func interpreter(t *testing.T, prog []insn) func(call) uint32 {
 	t.Helper()
-	return func(arch, nr uint32) uint32 {
+	return func(c call) uint32 {
 		var a uint32
 		for pc := 0; pc < len(prog); {
 			f := prog[pc]
 			switch f.code {
 			case 0x20: // BPF_LD|BPF_W|BPF_ABS
-				if f.k == 0 {
-					a = nr
-				} else {
-					a = arch
+				switch f.k {
+				case 0:
+					a = c.nr
+				case 4:
+					a = c.arch
+				case 16:
+					a = c.arg0
+				default:
+					t.Fatalf("load from unmodelled seccomp_data offset %d", f.k)
 				}
 				pc++
 			case 0x15: // BPF_JMP|BPF_JEQ|BPF_K
