@@ -70,8 +70,12 @@ var toolchainRead = []string{
 	"/usr/libexec",
 	"/usr/include",
 	"/usr/share",
-	"/usr/local", // /usr/local/go, /usr/local/bin/gopls
-	"/lib",       // ld-linux and libc on merged-usr and split layouts
+	"/usr/local", // /usr/local/go, the JDK, jdtls, clangd, node and every server
+	// Debian puts installed gems here rather than under /usr, and RubyGems finds
+	// them by this path with no environment set. It is the whole of ruby-lsp's
+	// wiring; binding it is cheaper than teaching the jail a GEM_HOME.
+	"/var/lib/gems",
+	"/lib", // ld-linux and libc on merged-usr and split layouts
 	"/lib64",
 	"/bin",
 	"/sbin",
@@ -271,8 +275,18 @@ func (s *Service) serve(ctx context.Context, l Lang, dir string) (*Conn, error) 
 			// No CPU ceiling: RLIMIT_CPU is total seconds, and on a warm server
 			// that is a scheduled death. The bound on a runaway server is the
 			// pod's cgroup and the idle TTL.
+			//
+			// RLIMIT_NPROC is not a per-server ceiling and never was: it is per
+			// UID, and every jail here runs as the same one, so the four live
+			// roots and the daemon's own threads spend a single budget. At 256
+			// that budget is a way for one language to starve another — a JVM
+			// carries some forty threads before it has answered anything, so
+			// three Java roots could leave the fifth server unable to fork and
+			// the log would blame the server that asked last. 2048 keeps the
+			// fork-bomb bound this is actually for while leaving the real
+			// ceiling where it belongs: address space, and the pod's cgroup.
 			AddrMiB: 6144, FsizeMiB: 256,
-			Nofile: 4096, Nproc: 256, TmpMiB: 2048,
+			Nofile: 4096, Nproc: 2048, TmpMiB: 2048,
 		},
 	})
 	return attach(ctx, cmd, l, dir)

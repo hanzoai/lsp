@@ -200,20 +200,35 @@ server did not answer; `503` sandbox unavailable.
 ### `GET /healthz` · `GET /readyz`
 
 Liveness answers 200 while the process is up. Readiness answers what the jail
-decided: `{ "ready": true, "jail": "jailed", "langs": ["go"] }`, or 503 with the
-reason. They are different questions and do not collapse into one.
+decided: `{ "ready": true, "jail": "jailed", "langs": [ … ] }`, or 503 with the
+reason. `langs` is the table narrowed to the servers this image actually has, so
+it is also the honest answer to "what can you speak". They are different
+questions and do not collapse into one.
 
 ## Languages
 
-`internal/lsp/langs.go` carries five complete entries — `go`, `rust`,
-`typescript`, `python`, `cpp` — with argv, root markers, extensions, cache and
-fetch. What decides whether one is SERVED is `Lang.Available()`: whether its
-binary is on PATH in the image.
-
-**Phase 1 ships the Go toolchain and gopls, so Go is the only language served.**
-The other four are inert in this image and light up the moment their server is
-installed in the Dockerfile — no code change. That is deliberate: the table never
+`internal/lsp/langs.go` carries one entry per language — argv, root markers,
+extensions, cache and fetch. What decides whether one is SERVED is
+`Lang.Available()`: whether its binary is on PATH in the image. The table never
 promises what the deployment cannot do.
+
+| | server | fetch | resolves dependencies from |
+|---|---|---|---|
+| `go` | gopls | `go mod download all` | the module cache |
+| `typescript` (`.ts` `.tsx` `.js` `.jsx`) | typescript-language-server + tsserver | `npm ci --ignore-scripts` | `node_modules` in the tree |
+| `php` | intelephense | `composer install --no-scripts --no-plugins` | `vendor/` in the tree |
+| `rust` | rust-analyzer | `cargo fetch --locked` | the cargo registry cache |
+| `python` | pyright | none — `uv sync` builds sdists | source + bundled typeshed |
+| `ruby` | ruby-lsp | none — `bundle install` compiles | source + the `rbs` core signatures |
+| `java` | jdtls | none — every Java resolver is a build tool | source + the JDK |
+| `cpp` (`.c` `.h` too) | clangd | none — no resolver exists | `compile_commands.json`, else one file |
+
+The four with no fetch still answer about the tree's own source and its
+platform's; what they lose is a definition that crosses into a third-party
+package. That is the scripts-off trade, taken deliberately: see `Fetchable`.
+
+A server that fails to start takes only its own language down — `build()` logs
+`language server did not start` and the rest of the tree keeps answering.
 
 ## Bounds
 
@@ -371,5 +386,9 @@ BINARY and a self-exec'd test suite proves nothing.
 3. **MCP.** EXTEND the existing single `lsp` tool (`mcp/rust/src/tools/lsp_tool.rs`,
    `python-sdk/pkg/hanzo-tools-lsp`) with `repo`/`rev` parameters — a file goes
    to the local stdio server, a repo goes to `/v1/code/lsp/*`. Not a new tool.
-4. **More languages** = install the server in the Dockerfile. The table entries
-   already exist.
+4. **More languages** = install the server in the Dockerfile and add its entry.
+   DONE for the nine above. Two of them are worth watching: rust-analyzer runs
+   `cargo metadata` against a READ-ONLY `CARGO_HOME`, and cargo wants to take a
+   lock there; jdtls is a JVM under a 6 GiB address-space rlimit. Both are the
+   shape of problem Go had with `/proc`, and both degrade to a language that
+   does not answer rather than a daemon that does not run.

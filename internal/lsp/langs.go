@@ -17,8 +17,9 @@ package lsp
 // adding a language to production is adding a toolchain to the Dockerfile — no
 // code change, no entry to remember to write.
 //
-// Phase 1 ships the Go toolchain and gopls. The other four entries are inert in
-// that image and light up the moment their toolchain is installed.
+// The image ships every server here. An entry is therefore a claim the
+// deployment keeps, and a server that cannot start takes only its own language
+// down: build() logs it and the others go on answering.
 //
 // # Scripts-off, and why the fetch phase does not weaken it
 //
@@ -156,7 +157,16 @@ var table = map[string]Lang{
 		// `cargo fetch` downloads and unpacks; it does not compile, so no build.rs
 		// runs. `cargo build` would, which is why the fetch is not that.
 		Fetch: []string{"cargo", "fetch", "--locked"},
-		Env:   []string{"CARGO_HOME=${cache}", "RUSTUP_TOOLCHAIN=stable"},
+		// No RUSTUP_TOOLCHAIN, because there is no rustup: the image installs the
+		// component tarballs, so `cargo` and `rustc` are the real binaries and
+		// read no rust-toolchain.toml. A tenant cannot name a compiler this
+		// deployment would then go and download — the Rust reading of
+		// GOTOOLCHAIN=local above.
+		Env: []string{"CARGO_HOME=${cache}"},
+		// Offline is belt to the seccomp braces, exactly as GOPROXY=off is: the
+		// serve phase can obtain no socket, and saying so gets a clean "not
+		// downloaded" out of cargo instead of a connection that cannot be made.
+		ServeEnv: []string{"CARGO_NET_OFFLINE=true"},
 		// The fetch being safe is not enough: rust-analyzer COMPILES AND RUNS
 		// build.rs and expands proc macros at workspace load, by default. That is
 		// the same code execution the fetch was careful to avoid, arriving through
@@ -179,6 +189,17 @@ var table = map[string]Lang{
 		// they land in the TREE, so node_modules is reported repo-relative.
 		Fetch: []string{"npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"},
 		Env:   []string{"npm_config_cache=${cache}", "npm_config_update_notifier=false"},
+		// And this is the other half of that bargain. Left alone,
+		// typescript-language-server prefers the TREE's own
+		// node_modules/typescript over the one beside it — it would load and RUN
+		// dependency-authored JavaScript in the serve phase, which is precisely
+		// the execution --ignore-scripts declined to perform one phase earlier.
+		// Naming the path takes the user setting, which wins over the workspace
+		// lookup, so the server is the image's pinned TypeScript and two
+		// identical requests cannot be answered by two different compilers.
+		Init: map[string]any{
+			"tsserver": map[string]any{"path": "/usr/local/lib/node_modules/typescript/lib/tsserver.js"},
+		},
 	},
 	"python": {
 		Name:  "python",
@@ -203,6 +224,107 @@ var table = map[string]Lang{
 		// No fetch: C++ has no dependency resolver to run. clangd answers from
 		// compile_commands.json when the tree carries one, and degrades to
 		// single-file mode when it does not.
+	},
+	"java": {
+		Name: "java",
+		// The project's own launcher rather than a hand-written `java -jar`. It
+		// already asks Equinox for a CASCADED configuration, which is the one
+		// thing an OSGi application needs to run from a read-only installation,
+		// and copying that incantation here would be a second copy to keep right.
+		//
+		// What it does not do is name the WRITABLE half, and Equinox's fallback
+		// for that is the home directory out of /etc/passwd — not $HOME, which is
+		// why setting HOME does not contain it. In this image that is /home/lsp,
+		// a path the jail does not bind, so the bundle cache would be written
+		// nowhere. Naming it puts the cache and the workspace index on the jail's
+		// own /tmp, where they die with the process that wrote them.
+		//
+		// -Xms256m overrides the launcher's hardcoded -Xms1G: a JVM per Java root
+		// under a 6 GiB address-space ceiling is no place to commit a gigabyte
+		// before the first question. The last -Xms wins and the launcher appends
+		// these after its own.
+		Start: []string{"jdtls",
+			"--jvm-arg=-Xms256m",
+			"--jvm-arg=-Xmx1G",
+			"--jvm-arg=-Dosgi.configuration.area=/tmp/jdtls/config",
+			// jdtls writes .project, .classpath and .settings/ into the PROJECT by
+			// default. The tree is read-only while serving, so that is a failed
+			// import rather than a modified tree; this keeps them in the workspace
+			// metadata, which is where a server's bookkeeping belongs anyway.
+			"--jvm-arg=-Djava.import.generatesMetadataFilesAtProjectRoot=false",
+			"-data", "/tmp/jdtls/data",
+		},
+		Roots: []string{"pom.xml", "build.gradle", "build.gradle.kts"},
+		Exts:  []string{".java"},
+		// No fetch, and unlike C++ it is not for want of a resolver — Java has
+		// two. It is that both of them ARE build tools. Maven resolves in-process
+		// through m2e and runs the pom's plugins; Gradle runs the build script
+		// itself, and its wrapper first downloads whichever distribution the tree
+		// names. Every Java dependency fetch is dependency code executing, so
+		// there is none, and jdtls answers from the tree's source and the JDK's.
+		Env: []string{"JAVA_HOME=/usr/local/jdk"},
+		// The same execution arriving through the SERVER instead of the fetch —
+		// the shape rust's Init refuses. Both importers off, the Gradle wrapper's
+		// download off, and autobuild off because a build is where an annotation
+		// processor on the classpath would run. Name resolution needs none of
+		// them: JDT indexes source, and that index is what answers.
+		//
+		// FLAT dotted keys, all of them. jdtls looks the literal dotted key up
+		// first and only then walks nested maps, so either spelling works alone —
+		// but a half-nested one matches nothing and says so nowhere.
+		Init: map[string]any{
+			"settings": map[string]any{
+				"java.import.maven.enabled":          false,
+				"java.import.gradle.enabled":         false,
+				"java.import.gradle.wrapper.enabled": false,
+				"java.maven.downloadSources":         false,
+				"java.eclipse.downloadSources":       false,
+				"java.autobuild.enabled":             false,
+			},
+		},
+	},
+	"php": {
+		Name:  "php",
+		Start: []string{"intelephense", "--stdio"},
+		Roots: []string{"composer.json"},
+		Exts:  []string{".php"},
+		Cache: "composer",
+		// --no-scripts --no-plugins is composer's own spelling of scripts-off, and
+		// it is the bargain npm's --ignore-scripts makes: vendor/ is placed, none
+		// of its authors' code runs. vendor/ lands in the TREE, so an answer
+		// inside a dependency is reported repo-relative.
+		Fetch: []string{"composer", "install", "--no-scripts", "--no-plugins", "--no-interaction"},
+		Env:   []string{"COMPOSER_HOME=${cache}"},
+		// intelephense keeps its index on disk and defaults it under the home
+		// directory. /tmp is the jail's own tmpfs, so naming it makes the index
+		// per-process and it dies with the server — and there is nothing to
+		// invalidate, because a root is immutable.
+		Init: map[string]any{
+			"storagePath":       "/tmp/intelephense/workspace",
+			"globalStoragePath": "/tmp/intelephense/global",
+		},
+	},
+	"ruby": {
+		Name:  "ruby",
+		Start: []string{"ruby-lsp"},
+		Roots: []string{"Gemfile"},
+		Exts:  []string{".rb", ".rake", ".gemspec"},
+		Cache: "bundle",
+		// `bundle install` COMPILES: a gem with a native extension runs its
+		// extconf.rb and then make, as us. So this one executes and therefore does
+		// not run, the same answer python gets. ruby-lsp indexes the interpreter's
+		// own library directory and the core signatures shipped inside the rbs
+		// gem, so the standard library resolves without any of it.
+		Fetch:    []string{"bundle", "install"},
+		Executes: true,
+		// BUNDLE_GEMFILE IS LOAD-BEARING, and not for what it names. ruby-lsp's
+		// launcher asks only whether this variable is SET; when it is not, it
+		// creates a .ruby-lsp directory in the tree and shells out to `bundle
+		// install` before the server starts — a write to a read-only tree and a
+		// download in the phase that has no socket. Any value at all takes that
+		// path off the table, and this one names nothing, so what gets indexed is
+		// the workspace and the interpreter, never a half-installed bundle.
+		Env: []string{"BUNDLE_GEMFILE=/nonexistent/Gemfile", "BUNDLE_PATH=${cache}"},
 	},
 }
 
