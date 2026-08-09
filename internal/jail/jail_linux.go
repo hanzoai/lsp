@@ -491,6 +491,8 @@ func Probe(ctx context.Context, root string) error {
 //     AUDIT_ARCH_X86_64 with amd64 — the arch check alone does not catch it, yet
 //     every x32 number is ORed with that bit and would dodge the numeric deny;
 //   - returns ERRNO(EPERM) for the denied numbers;
+//   - allows socketpair for AF_UNIX ONLY, and refuses every other family — see
+//     the note on it below;
 //   - ALLOWs everything else, because a toolchain's syscall surface is wide and
 //     an allow-list of it would be a list of everything.
 
@@ -520,10 +522,26 @@ var escape = []uint32{
 	syscall.SYS_KEXEC_LOAD, sysKexecFileLoad,
 }
 
-// network is denied in the SERVE phase only. With no call that returns a socket
-// fd, connect/sendto/recvfrom are unreachable: egress is impossible by
-// construction rather than filtered by policy.
-var network = []uint32{syscall.SYS_SOCKET, syscall.SYS_SOCKETPAIR}
+// network is denied in the SERVE phase only. socket() is the only call that
+// hands out a fd to a NETWORK, so with it denied connect/sendto/recvfrom are
+// unreachable: egress is impossible by construction rather than filtered by
+// policy.
+//
+// socketpair is NOT here, and that is a correction rather than a concession.
+// It was, and the cost was TypeScript: a socketpair is how libuv gives a child
+// its stdio, so denying it does not stop a network — it stops Node starting a
+// process at all, and typescript-language-server exists to run tsserver. It
+// failed with `spawn EPERM` and every other language kept working, which is the
+// graceful-degrade design telling the truth about a boundary drawn in the wrong
+// place.
+//
+// A socketpair reaches nothing. Both ends come back already connected to each
+// other, in AF_UNIX, inside this jail's own namespaces; it cannot be connect()ed
+// elsewhere, and a peer that could pass a network fd over it would have to be
+// outside the jail, where nothing is. Filtering it to AF_UNIX (filter, below)
+// keeps the claim above exact — no INET fd by construction — rather than resting
+// on the fact that the kernel implements socketpair for no other family.
+var network = []uint32{syscall.SYS_SOCKET}
 
 // denied is the deny-list for p. The ONE difference between the phases lives
 // here, in a two-line function, so "what does Fetch have that Serve does not"
@@ -557,6 +575,7 @@ const (
 
 	rlimitNproc     = 6  // RLIMIT_NPROC, absent from Go's syscall package
 	prSetNoNewPrivs = 38 // PR_SET_NO_NEW_PRIVS
+	afUnix          = 1  // AF_UNIX, the only family socketpair may name here
 )
 
 // Filter return actions and arch markers. Package-level so the builder and its
@@ -580,6 +599,12 @@ func filter(p phase) []insn {
 		ret   = 0x06 | 0x00        // BPF_RET|BPF_K
 		atNR  = 0                  // seccomp_data.nr
 		atArc = 4                  // seccomp_data.arch
+		// seccomp_data.args[0] is 64 bits at offset 16; cBPF loads 32, and on a
+		// little-endian machine that offset IS the low half. That half is the
+		// whole of the answer here: sys_socketpair takes an `int family`, so the
+		// kernel truncates the register to exactly these bits, and the filter and
+		// the kernel therefore read the same number.
+		atArg0 = 16
 	)
 	nrs := denied(p)
 	prog := []insn{
@@ -593,14 +618,28 @@ func filter(p phase) []insn {
 		{code: ld, k: atNR},
 		{code: jset, jt: 0, jf: 1, k: x32Bit},
 		{code: ret, k: retKill},
+		// 3. socketpair, decided on its FAMILY rather than its number — the one
+		// place this filter reads an argument. AF_UNIX is a pipe between a process
+		// and its own child and reaches nothing (see network, above); every other
+		// family is refused, so "no fd to a network" stays a property of the
+		// program and not a fact about which families the kernel bothered to
+		// implement.
+		//
+		// Reading args[0] CLOBBERS the accumulator, so this arm never falls
+		// through — both edges are terminals. A number that is not socketpair
+		// skips both instructions with the number still loaded.
+		{code: jeq, jt: 0, jf: 2, k: syscall.SYS_SOCKETPAIR},
+		{code: ld, k: atArg0},
+		{code: jeq, jt: uint8(len(nrs)), jf: uint8(len(nrs)) + 1, k: afUnix},
 	}
-	// 3. Each denied number jumps forward to the shared ERRNO terminal, over the
+	// 4. Each denied number jumps forward to the shared ERRNO terminal, over the
 	// remaining compares and over the ALLOW. jt is an offset from the NEXT
 	// instruction and is 8 bits; the list is far below 250 long.
 	for i, nr := range nrs {
 		prog = append(prog, insn{code: jeq, jt: uint8(len(nrs)-1-i) + 1, k: nr})
 	}
-	// 4. The two terminals.
+	// 5. The two terminals. Everything above that jumps forward is measured to
+	// land on one of these two, which is why they are appended last and once.
 	return append(prog, insn{code: ret, k: retAllow}, insn{code: ret, k: retErrno})
 }
 

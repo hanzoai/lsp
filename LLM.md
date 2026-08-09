@@ -24,15 +24,25 @@ a definition that left the repository and landed in the dependency cache.
 | | FETCH | SERVE |
 |---|---|---|
 | runs | `go mod download` — first-party toolchain, download-only | `gopls serve -mode=stdio` — third-party, parses tenant source |
-| socket | permitted | **denied** by seccomp (`socket`, `socketpair`, and the io_uring family) |
+| socket | permitted | **denied** by seccomp (`socket` and the io_uring family; `socketpair` is allowed for AF_UNIX only, which is a pipe to your own child and reaches nothing) |
 | tree | writable | read-only |
 | dependency cache | writable | read-only |
 | namespaces | new user/mount/pid/ipc/uts, minimal chroot, rlimits, `no_new_privs` | same |
 
 The phase is not a field anyone sets — it is `jail.Fetch` or `jail.Serve`, two
 functions, so there is no value to get wrong. The only difference between their
-seccomp filters is `socket`/`socketpair`, and that is one two-line function
-(`denied` in `internal/jail/jail_linux.go`).
+seccomp filters is `socket`, and that is one two-line function (`denied` in
+`internal/jail/jail_linux.go`).
+
+`socketpair` used to be denied beside it and is not any more. It reaches nothing
+— both ends come back already connected to each other, in AF_UNIX, inside this
+jail's namespaces — but it is how libuv gives a child its stdio, so denying it
+did not stop a network, it stopped **Node starting a process**. TypeScript's
+server exists to run `tsserver`, so it died with `spawn EPERM` while every other
+language kept answering. The filter now decides `socketpair` on its FAMILY, the
+one argument it reads, so "no fd to a network" stays a property of the program
+rather than a fact about which families the kernel implements
+(`TestSocketpairIsDecidedByItsFamily`).
 
 Fetches that would run DEPENDENCY-authored code (`uv sync` building an sdist,
 `npm install` running postinstall, `cargo build` running build.rs) do not run at
@@ -387,8 +397,14 @@ BINARY and a self-exec'd test suite proves nothing.
    `python-sdk/pkg/hanzo-tools-lsp`) with `repo`/`rev` parameters — a file goes
    to the local stdio server, a repo goes to `/v1/code/lsp/*`. Not a new tool.
 4. **More languages** = install the server in the Dockerfile and add its entry.
-   DONE for the nine above. Two of them are worth watching: rust-analyzer runs
-   `cargo metadata` against a READ-ONLY `CARGO_HOME`, and cargo wants to take a
-   lock there; jdtls is a JVM under a 6 GiB address-space rlimit. Both are the
-   shape of problem Go had with `/proc`, and both degrade to a language that
-   does not answer rather than a daemon that does not run.
+   DONE for the nine above, and verified on the gVisor node at 0.1.6: Go,
+   Python, Rust, C, C++, Java, PHP and Ruby all answered `locate definition`
+   jailed, Ruby into the interpreter's own library with `external: true`.
+   TypeScript and JavaScript did not, for the `socketpair` reason above — one
+   language's server failing is one language, which is the graceful-degrade
+   design doing its job and the reason the other eight shipped anyway.
+
+   Two things a repo needs before its dependencies resolve, neither a bug:
+   `cargo fetch --locked` wants a committed `Cargo.lock`, and `npm ci` wants a
+   `package-lock.json`. Without one the fetch is skipped, logged, and the server
+   still answers about the tree's own source.
