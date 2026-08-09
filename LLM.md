@@ -397,12 +397,16 @@ BINARY and a self-exec'd test suite proves nothing.
    `python-sdk/pkg/hanzo-tools-lsp`) with `repo`/`rev` parameters — a file goes
    to the local stdio server, a repo goes to `/v1/code/lsp/*`. Not a new tool.
 4. **More languages** = install the server in the Dockerfile and add its entry.
-   DONE for the nine above, and verified on the gVisor node at 0.1.6: Go,
-   Python, Rust, C, C++, Java, PHP and Ruby all answered `locate definition`
-   jailed, Ruby into the interpreter's own library with `external: true`.
-   TypeScript and JavaScript did not, for the `socketpair` reason above — one
-   language's server failing is one language, which is the graceful-degrade
-   design doing its job and the reason the other eight shipped anyway.
+   DONE, and verified on the gVisor node: all nine answer `locate definition`
+   jailed — Go, TypeScript, JavaScript, Python, Rust, C, C++, Java, PHP, Ruby —
+   with Ruby resolving into the interpreter's own library at `external: true`.
+
+   It took two images to get there, and the failure is worth keeping. At 0.1.6
+   TypeScript and JavaScript were the only two that did not answer: `spawn
+   EPERM`, because `socketpair` was denied (see the invariant above). Every
+   other language kept working and the daemon logged the reason per root, which
+   is the graceful-degrade design earning its keep — one server failing cost one
+   language, not the service.
 
    Two things a repo needs before its dependencies resolve, neither a bug:
    `cargo fetch --locked` wants a committed `Cargo.lock`, and `npm ci` wants a
