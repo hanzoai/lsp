@@ -187,6 +187,11 @@ func TestTypeScriptDialects(t *testing.T) {
 	cases := map[string]string{
 		"a.ts": "typescript", "a.tsx": "typescriptreact",
 		"a.js": "javascript", "a.jsx": "javascriptreact",
+		// The module-system extensions are the same two dialects, and a file
+		// told it is TypeScript when it is JavaScript gets type errors it was
+		// never written to satisfy.
+		"a.mjs": "javascript", "a.cjs": "javascript",
+		"a.mts": "typescript", "a.cts": "typescript",
 	}
 	for path, want := range cases {
 		if got := ts.ID(path); got != want {
