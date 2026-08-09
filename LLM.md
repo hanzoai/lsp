@@ -215,7 +215,7 @@ promises what the deployment cannot do.
 | | server | fetch | resolves dependencies from |
 |---|---|---|---|
 | `go` | gopls | `go mod download all` | the module cache |
-| `typescript` (`.ts` `.tsx` `.js` `.jsx`) | typescript-language-server + tsserver | `npm ci --ignore-scripts` | `node_modules` in the tree |
+| `typescript` (`.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs`) | typescript-language-server + tsserver | `npm ci --ignore-scripts` | `node_modules` in the tree |
 | `php` | intelephense | `composer install --no-scripts --no-plugins` | `vendor/` in the tree |
 | `rust` | rust-analyzer | `cargo fetch --locked` | the cargo registry cache |
 | `python` | pyright | none — `uv sync` builds sdists | source + bundled typeshed |

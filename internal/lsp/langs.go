@@ -181,7 +181,11 @@ var table = map[string]Lang{
 		Name:  "typescript",
 		Start: []string{"typescript-language-server", "--stdio"},
 		Roots: []string{"tsconfig.json", "package.json"},
-		Exts:  []string{".ts", ".tsx", ".js", ".jsx"},
+		// .mjs and .cjs are how a Node package says which module system a file is
+		// in, and tsserver reads both. Leaving them out meant a package that
+		// spells its entry point .mjs — an ordinary modern one — looked to
+		// Speaks() like a repository with no JavaScript in it at all.
+		Exts: []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"},
 		Cache: "npm",
 		// --ignore-scripts is the whole reason this fetch is allowed: it is npm's
 		// own switch for "place the tree, run none of its lifecycle hooks". The
@@ -387,7 +391,7 @@ func (l Lang) ID(p string) string {
 		return "typescriptreact"
 	case ".jsx":
 		return "javascriptreact"
-	case ".js":
+	case ".js", ".mjs", ".cjs":
 		return "javascript"
 	default:
 		return "typescript"
