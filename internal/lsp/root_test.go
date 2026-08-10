@@ -151,7 +151,7 @@ func TestModulesAreWhereTheFetchRuns(t *testing.T) {
 	paths := []string{
 		"go.mod", "main.go",
 		"service/go.mod", "service/main.go",
-		"web/package.json", "web/index.ts",
+		"web/package.json", "web/package-lock.json", "web/index.ts",
 		"docs/readme.md",
 	}
 	got := table["go"].Modules(paths)
@@ -163,6 +163,32 @@ func TestModulesAreWhereTheFetchRuns(t *testing.T) {
 	}
 	if got := table["rust"].Modules(paths); len(got) != 0 {
 		t.Errorf("rust modules = %v, want none", got)
+	}
+}
+
+// TestAFetchIsOnlyLocatedWhereItCanRun is a defect, kept as an assertion.
+//
+// A tree with a package.json and no lockfile got an `npm ci`, which refuses to
+// run without one. The fetch failed on every such repo — every library that
+// commits no lock — and the WARN it left behind was the only sign. The marker
+// for a fetch has to be the file the fetch itself requires, or the daemon is
+// running commands it already knows will fail.
+func TestAFetchIsOnlyLocatedWhereItCanRun(t *testing.T) {
+	ts := table["typescript"]
+	if got := ts.Modules([]string{"package.json", "a.ts"}); len(got) != 0 {
+		t.Errorf("npm module at %v for a tree with no lockfile — `npm ci` cannot run there", got)
+	}
+	for _, lock := range []string{"package-lock.json", "npm-shrinkwrap.json"} {
+		if got := ts.Modules([]string{"package.json", lock}); !slices.Equal(got, []string{"."}) {
+			t.Errorf("%s: typescript modules = %v, want [.] — a locked tree must still fetch", lock, got)
+		}
+	}
+	rs := table["rust"]
+	if got := rs.Modules([]string{"Cargo.toml", "src/main.rs"}); len(got) != 0 {
+		t.Errorf("cargo module at %v with no Cargo.lock — `cargo fetch --locked` cannot run there", got)
+	}
+	if got := rs.Modules([]string{"Cargo.toml", "Cargo.lock"}); !slices.Equal(got, []string{"."}) {
+		t.Errorf("rust modules = %v, want [.] — a locked crate must still fetch", got)
 	}
 }
 

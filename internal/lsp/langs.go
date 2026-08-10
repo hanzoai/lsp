@@ -57,8 +57,14 @@ type Lang struct {
 	// Start is the argv that runs the server speaking JSON-RPC on its stdio.
 	Start []string
 
-	// Roots are the marker files that make a directory a module of this
-	// language. They locate the FETCH; the server itself is rooted at the tree.
+	// Roots are the marker files that locate the FETCH — the server itself is
+	// rooted at the whole tree and never reads this.
+	//
+	// So a marker is not "what makes this a project of this language", it is
+	// WHAT THE FETCH NEEDS IN ORDER TO RUN. The two are not the same file: `npm
+	// ci` refuses to work from a package.json alone and wants the lockfile, and
+	// `cargo fetch --locked` wants Cargo.lock. Naming the looser file means
+	// running a command already known to fail — see Modules.
 	Roots []string
 
 	// Exts are the file extensions this server answers for.
@@ -151,7 +157,11 @@ var table = map[string]Lang{
 	"rust": {
 		Name:  "rust",
 		Start: []string{"rust-analyzer"},
-		Roots: []string{"Cargo.toml"},
+		// Cargo.lock, not Cargo.toml: --locked is what makes this fetch safe to
+		// run, and it is also what makes a lockless tree an error rather than a
+		// resolution. A library that commits no lock gets no fetch and
+		// rust-analyzer answers from source.
+		Roots: []string{"Cargo.lock"},
 		Exts:  []string{".rs"},
 		Cache: "cargo",
 		// `cargo fetch` downloads and unpacks; it does not compile, so no build.rs
@@ -180,7 +190,12 @@ var table = map[string]Lang{
 	"typescript": {
 		Name:  "typescript",
 		Start: []string{"typescript-language-server", "--stdio"},
-		Roots: []string{"tsconfig.json", "package.json"},
+		// THE LOCKFILE, not package.json, and this one was a live defect. `npm ci`
+		// exists to install exactly what a lockfile pins and refuses outright
+		// without one — so a package.json alone bought a fetch that could only
+		// ever fail, and libraries very often commit no lock. tsconfig.json is
+		// not here for the same reason: npm has nothing to do with it.
+		Roots: []string{"package-lock.json", "npm-shrinkwrap.json"},
 		// .mjs and .cjs are how a Node package says which module system a file is
 		// in, and tsserver reads both. Leaving them out meant a package that
 		// spells its entry point .mjs — an ordinary modern one — looked to

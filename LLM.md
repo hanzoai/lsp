@@ -225,9 +225,9 @@ promises what the deployment cannot do.
 | | server | fetch | resolves dependencies from |
 |---|---|---|---|
 | `go` | gopls | `go mod download all` | the module cache |
-| `typescript` (`.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs`) | typescript-language-server + tsserver | `npm ci --ignore-scripts` | `node_modules` in the tree |
+| `typescript` (`.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs`) | typescript-language-server + tsserver | `npm ci --ignore-scripts`, where a lockfile is committed | `node_modules` in the tree |
 | `php` | intelephense | `composer install --no-scripts --no-plugins` | `vendor/` in the tree |
-| `rust` | rust-analyzer | `cargo fetch --locked` | the cargo registry cache |
+| `rust` | rust-analyzer | `cargo fetch --locked`, where a lockfile is committed | the cargo registry cache |
 | `python` | pyright | none — `uv sync` builds sdists | source + bundled typeshed |
 | `ruby` | ruby-lsp | none — `bundle install` compiles | source + the `rbs` core signatures |
 | `java` | jdtls | none — every Java resolver is a build tool | source + the JDK |
@@ -408,7 +408,9 @@ BINARY and a self-exec'd test suite proves nothing.
    is the graceful-degrade design earning its keep — one server failing cost one
    language, not the service.
 
-   Two things a repo needs before its dependencies resolve, neither a bug:
-   `cargo fetch --locked` wants a committed `Cargo.lock`, and `npm ci` wants a
-   `package-lock.json`. Without one the fetch is skipped, logged, and the server
-   still answers about the tree's own source.
+   A repo needs a committed lockfile before its dependencies resolve, and that
+   is what `Lang.Roots` names — the file the FETCH requires, not the file that
+   makes it a project. `npm ci` refuses to run without `package-lock.json`, and
+   `cargo fetch --locked` without `Cargo.lock`. Point the marker at the looser
+   file and the daemon runs a command it already knows will fail, on every
+   library that commits no lock.
