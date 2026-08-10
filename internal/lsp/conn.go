@@ -56,6 +56,15 @@ const (
 	deathWait = 2 * time.Second
 )
 
+// The protocol's one retryable answer. -32801 is ContentModified: the result
+// was computed against state the server has since replaced, so it is stale
+// rather than wrong, and the spec has the client ask again.
+const (
+	contentModified = -32801
+	modifiedTries   = 4
+	modifiedWait    = 400 * time.Millisecond
+)
+
 // Conn is one live language server: a process (or, in a test, a pipe) plus the
 // bookkeeping to route its stream. Safe for concurrent use — Call may be entered
 // from several requests against the same warm root.
@@ -279,8 +288,33 @@ func (c *Conn) handshake(ctx context.Context, l Lang, root string) error {
 	return c.Notify("initialized", map[string]any{})
 }
 
-// Call issues a request and waits for the response with that id.
+// Call issues a request, and retries the one rpc error that is not a failure.
+//
+// ContentModified means the server's state moved while it was computing —
+// rust-analyzer says it for every query that lands during a workspace load — and
+// the protocol's own instruction is to ask again. Reporting it to the caller
+// turned "not ready yet, retry" into a 502 and cost Rust one query in five.
+//
+// It is retried HERE, in the client that speaks the protocol, so every op gets
+// it once rather than each caller learning the code. The bound is the caller's
+// context: this backs off a little and gives up long before callWait does.
 func (c *Conn) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	for attempt := 0; ; attempt++ {
+		raw, err := c.call(ctx, method, params)
+		var rpc *rpcError
+		if !errors.As(err, &rpc) || rpc.Code != contentModified || attempt >= modifiedTries {
+			return raw, err
+		}
+		select {
+		case <-time.After(modifiedWait):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// call is one attempt at a request, and waits for the response with that id.
+func (c *Conn) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := c.seq.Add(1)
 	ch := make(chan msg, 1)
 

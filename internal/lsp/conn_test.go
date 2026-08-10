@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,6 +39,9 @@ type fake struct {
 	push map[string]any
 	// init is the initialize params as they arrived on the wire.
 	init json.RawMessage
+	// stale is how many times a method answers ContentModified before it answers
+	// properly — what a server does while its workspace is still loading.
+	stale map[string]int
 }
 
 // serve reads frames from r and writes answers to w until r closes.
@@ -69,6 +73,17 @@ func (f *fake) serve(r io.Reader, w io.WriteCloser) {
 			return
 		}
 		if len(m.ID) > 0 { // a request: answer it
+			f.mu.Lock()
+			left := f.stale[m.Method]
+			if left > 0 {
+				f.stale[m.Method] = left - 1
+			}
+			f.mu.Unlock()
+			if left > 0 {
+				f.write(w, map[string]any{"jsonrpc": "2.0", "id": m.ID,
+					"error": map[string]any{"code": contentModified, "message": "content modified"}})
+				continue
+			}
 			result, ok := f.reply[m.Method]
 			if !ok {
 				result = map[string]any{}
@@ -120,9 +135,6 @@ func sample(t *testing.T, name, body string) (string, string) {
 	return dir, abs
 }
 
-// TestDefinitionDrivesTheProtocol is the core claim: given a position, the client
-// performs initialize → initialized → didOpen → definition, in that order, and
-// parses the Location the server answered with.
 // TestNobodyIsWatchingTheClient pins the field that cost three languages every
 // question after their first.
 //
@@ -164,6 +176,39 @@ func TestNobodyIsWatchingTheClient(t *testing.T) {
 	}
 }
 
+// TestContentModifiedIsAskAgainNotAFailure pins the one rpc error that means
+// "not ready", which cost Rust a query in every five.
+//
+// A server answers -32801 when the state it computed against has already been
+// replaced — rust-analyzer says it for anything asked during a workspace load.
+// The result is stale, not wrong, and the protocol's instruction is to ask
+// again. Passing it up as an error turned that into a 502 for the caller.
+func TestContentModifiedIsAskAgainNotAFailure(t *testing.T) {
+	f := &fake{
+		reply: map[string]any{"textDocument/definition": []any{}},
+		stale: map[string]int{"textDocument/definition": 2},
+	}
+	c := dial(t, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := c.Call(ctx, "textDocument/definition", map[string]any{}); err != nil {
+		t.Fatalf("Call = %v, want the answer after the server settled", err)
+	}
+
+	// And it does give up: a server that never settles must not be retried
+	// forever inside one request.
+	f2 := &fake{stale: map[string]int{"textDocument/hover": modifiedTries + 5}}
+	c2 := dial(t, f2)
+	var rpc *rpcError
+	if _, err := c2.Call(ctx, "textDocument/hover", map[string]any{}); !errors.As(err, &rpc) || rpc.Code != contentModified {
+		t.Fatalf("Call = %v, want it to give up with ContentModified", err)
+	}
+}
+
+// TestDefinitionDrivesTheProtocol is the core claim: given a position, the client
+// performs initialize → initialized → didOpen → definition, in that order, and
+// parses the Location the server answered with.
 func TestDefinitionDrivesTheProtocol(t *testing.T) {
 	dir, abs := sample(t, "main.go", "package main\n\nfunc main() {}\n")
 	target := filepath.Join(dir, "other.go")
