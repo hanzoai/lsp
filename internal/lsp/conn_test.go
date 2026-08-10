@@ -36,6 +36,8 @@ type fake struct {
 	// push, when set, is published as a diagnostics notification after didOpen,
 	// which is how a real server delivers them: unsolicited, not as a response.
 	push map[string]any
+	// init is the initialize params as they arrived on the wire.
+	init json.RawMessage
 }
 
 // serve reads frames from r and writes answers to w until r closes.
@@ -50,6 +52,7 @@ func (f *fake) serve(r io.Reader, w io.WriteCloser) {
 		var m struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
 		}
 		if json.Unmarshal(body, &m) != nil {
 			continue
@@ -57,6 +60,9 @@ func (f *fake) serve(r io.Reader, w io.WriteCloser) {
 
 		f.mu.Lock()
 		f.seen = append(f.seen, m.Method)
+		if m.Method == "initialize" {
+			f.init = m.Params
+		}
 		f.mu.Unlock()
 
 		if m.Method == "exit" {
@@ -117,6 +123,47 @@ func sample(t *testing.T, name, body string) (string, string) {
 // TestDefinitionDrivesTheProtocol is the core claim: given a position, the client
 // performs initialize → initialized → didOpen → definition, in that order, and
 // parses the Location the server answered with.
+// TestNobodyIsWatchingTheClient pins the field that cost three languages every
+// question after their first.
+//
+// processId is a watchdog: the spec has a server exit when its client's process
+// is gone, and every server built on vscode-languageserver polls kill(pid, 0) to
+// find out. A pid is only a name inside its own namespace, and the jail gives
+// each server a NEW one — so this daemon's pid names nothing there, the server
+// concluded its client had died, and it exited 1 within seconds. TypeScript,
+// JavaScript and Python answered exactly one query each; gopls does not poll,
+// so Go looked fine and the bug looked like TypeScript's.
+//
+// null is the spec's "nobody is watching", and the jail is what makes it safe:
+// the server is PID 1 of its namespace, so it dies with us either way.
+func TestNobodyIsWatchingTheClient(t *testing.T) {
+	dir, _ := sample(t, "main.go", "package main\n")
+	f := &fake{reply: map[string]any{"initialize": map[string]any{"capabilities": map[string]any{}}}}
+	c := dial(t, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.handshake(ctx, table["go"], dir); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	f.mu.Lock()
+	raw := f.init
+	f.mu.Unlock()
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("initialize params: %v", err)
+	}
+	pid, ok := got["processId"]
+	if !ok {
+		t.Fatal("initialize sent no processId at all; the spec wants the field, valued null")
+	}
+	if string(pid) != "null" {
+		t.Errorf("processId = %s, want null — a pid from another namespace is a watchdog that always fires", pid)
+	}
+}
+
 func TestDefinitionDrivesTheProtocol(t *testing.T) {
 	dir, abs := sample(t, "main.go", "package main\n\nfunc main() {}\n")
 	target := filepath.Join(dir, "other.go")
