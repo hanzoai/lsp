@@ -238,7 +238,23 @@ func (c *Conn) handshake(ctx context.Context, l Lang, root string) error {
 
 	uri := pathURI(root)
 	params := map[string]any{
-		"processId": os.Getpid(),
+		// NULL, and this is the whole reason TypeScript, JavaScript and Python
+		// answered exactly one question each and then vanished.
+		//
+		// processId is a WATCHDOG: the spec says a server whose parent has died
+		// should exit, and every server built on vscode-languageserver implements
+		// that by polling `kill(pid, 0)` every few seconds. This daemon used to
+		// send its own pid — which is a number in ITS pid namespace, and the
+		// server runs in a jail with a NEW ONE, where that number belongs to
+		// nothing. So the server looked for its client, correctly concluded it
+		// had died, and exited 1 a few seconds in. gopls does not poll, which is
+		// why Go alone survived and why this looked like a TypeScript bug.
+		//
+		// null is the spec's own way to say "nobody is watching", and it costs
+		// nothing here: the jail already ties the server's life to ours. It is
+		// PID 1 of that namespace, so Conn.Close kills it and everything it
+		// forked, and a daemon that dies takes the namespace with it.
+		"processId": nil,
 		"rootUri":   uri,
 		"rootPath":  root,
 		"capabilities": map[string]any{
