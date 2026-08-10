@@ -49,6 +49,11 @@ const (
 	initWait  = 120 * time.Second
 	callWait  = 30 * time.Second
 	closeWait = 3 * time.Second
+	// deathWait is how long a failed write waits for the reader to finish
+	// noticing the same death, so the error can name the cause instead of the
+	// broken pipe that noticed it first. It is short because both sides are
+	// learning about a process that has already exited.
+	deathWait = 2 * time.Second
 )
 
 // Conn is one live language server: a process (or, in a test, a pipe) plus the
@@ -73,6 +78,10 @@ type Conn struct {
 	done chan struct{} // closed when the reader stops
 	err  error         // why it stopped; read only after done
 	once sync.Once
+
+	// last is the server's own stderr, bounded — see attach. It is nil for a
+	// Conn over a pipe (the tests), and tail.why tolerates that.
+	last *tail
 }
 
 // msg is any JSON-RPC frame in either direction. Which of the four kinds it is
@@ -105,9 +114,16 @@ func attach(ctx context.Context, cmd *exec.Cmd, l Lang, root string) (*Conn, err
 	// left "lsp: server stopped" as the entire account of a startup crash —
 	// exactly the blindness Probe had with `exit status 126`.
 	//
-	// So: keep the LAST 4 KiB and surface it on ONE path, the error below. That
-	// error is built after Close, which kills the process and waits, so what the
-	// server managed to say is all there. Nothing is logged while it is healthy.
+	// So: keep the LAST 4 KiB and spend it on the errors that report a dead
+	// server — the handshake below, and every query after it (Conn.stopped).
+	// Nothing is logged while it is healthy.
+	//
+	// A server that dies MID-SESSION used to take its reason with it: the next
+	// query reported `write |1: broken pipe`, which names the symptom and not one
+	// thing about the cause, and that is all an operator got for a language that
+	// had silently stopped working. It is the same blindness `exit status 126`
+	// was for Probe, and it is fixed the same way — never report that something
+	// died without the words it died saying.
 	last := &tail{n: 4 << 10}
 	cmd.Stderr = last
 
@@ -131,6 +147,7 @@ func attach(ctx context.Context, cmd *exec.Cmd, l Lang, root string) (*Conn, err
 		}
 		_ = cmd.Wait()
 	})
+	c.last = last
 	if err := c.handshake(ctx, l, root); err != nil {
 		// Close first: it kills the process AND waits for it, which drains the
 		// stderr copy. Reading the tail before that races the last words away.
@@ -241,7 +258,16 @@ func (c *Conn) Call(ctx context.Context, method string, params any) (json.RawMes
 	if err := c.send(map[string]any{
 		"jsonrpc": "2.0", "id": id, "method": method, "params": params,
 	}); err != nil {
-		return nil, err
+		// A write that fails means the far end is already gone, and the pipe
+		// error says only that the pipe broke. The reader learns the same thing a
+		// moment later and has the reason; wait briefly for it rather than
+		// reporting the symptom that arrived first.
+		select {
+		case <-c.done:
+			return nil, c.stopped()
+		case <-time.After(deathWait):
+			return nil, fmt.Errorf("%w%s", err, c.last.why())
+		}
 	}
 
 	select {
@@ -456,11 +482,14 @@ func (c *Conn) publish(params json.RawMessage) {
 	c.dmu.Unlock()
 }
 
+// stopped is the ONE account of why this session ended, and it is where the
+// server's last words are spent. Every caller that discovers a dead server ends
+// up here, so the reason is attached once rather than at each discovery site.
 func (c *Conn) stopped() error {
 	if c.err != nil && !errors.Is(c.err, io.EOF) {
-		return fmt.Errorf("lsp: server stopped: %w", c.err)
+		return fmt.Errorf("lsp: server stopped: %w%s", c.err, c.last.why())
 	}
-	return errors.New("lsp: server stopped")
+	return fmt.Errorf("lsp: server stopped%s", c.last.why())
 }
 
 // readFrame reads one Content-Length-framed message.
