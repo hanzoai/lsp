@@ -75,13 +75,27 @@ type Conn struct {
 	omu  sync.Mutex
 	open map[string]bool // documents already declared to the server
 
-	done chan struct{} // closed when the reader stops
-	err  error         // why it stopped; read only after done
+	// done is closed when the reader has stopped AND the process has been reaped,
+	// so anything read after it — c.err, and the server's last words — is final.
+	// Closing it any earlier is what made the words race away; see reap.
+	done chan struct{}
+	err  error // why it stopped; read only after done
 	once sync.Once
+	gone sync.Once
 
 	// last is the server's own stderr, bounded — see attach. It is nil for a
 	// Conn over a pipe (the tests), and tail.why tolerates that.
 	last *tail
+}
+
+// reap kills the process and waits for it, which is also what drains the copy
+// of its stderr. Both endings run it — the reader when the server dies on its
+// own, Close when we end it — and it must happen exactly once, because two
+// concurrent Waits on one process is a race with no useful outcome.
+func (c *Conn) reap() {
+	if c.stop != nil {
+		c.gone.Do(c.stop)
+	}
 }
 
 // msg is any JSON-RPC frame in either direction. Which of the four kinds it is
@@ -145,7 +159,15 @@ func attach(ctx context.Context, cmd *exec.Cmd, l Lang, root string) (*Conn, err
 			// kill takes every `go list` it forked with it.
 			_ = cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
+		// HOW it ended, written where its words are. A process killed by the
+		// kernel — a seccomp verdict, the OOM killer, a rlimit — says nothing at
+		// all on stderr, so the exit status is the only account there is, and
+		// discarding it left "server stopped" as the whole story. Kill above
+		// cannot invent a status: on a process that has already exited it fails,
+		// and Wait still reports what actually happened to it.
+		if err := cmd.Wait(); err != nil {
+			fmt.Fprintf(last, "\n[%v]", err)
+		}
 	})
 	c.last = last
 	if err := c.handshake(ctx, l, root); err != nil {
@@ -401,9 +423,7 @@ func (c *Conn) Close() {
 		case <-c.done:
 		case <-time.After(closeWait):
 		}
-		if c.stop != nil {
-			c.stop()
-		}
+		c.reap()
 	})
 }
 
@@ -429,7 +449,13 @@ func (c *Conn) send(v any) error {
 // read is the sole owner of the inbound stream. Every frame is exactly one of
 // four kinds, and each has exactly one destination.
 func (c *Conn) read(r *bufio.Reader) {
-	defer close(c.done)
+	// Reap BEFORE announcing the end. Waiting for the process is what drains the
+	// copy of its stderr, so a reader that closed done first published a death
+	// with no reason attached — the words arrived microseconds later, to nobody.
+	defer func() {
+		c.reap()
+		close(c.done)
+	}()
 	for {
 		body, err := readFrame(r)
 		if err != nil {
