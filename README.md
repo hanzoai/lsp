@@ -1,5 +1,7 @@
 # lsp
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/lsp&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/lsp&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/lsp&ref=main&action=deploy)
+
 The jailed language-server daemon. It holds immutable per-(org, repo, commit)
 working trees, runs a language server over each one inside a jail with no
 network, and answers position questions about them.
